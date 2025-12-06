@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Audio files (will be in S3)
+audio_files/
+*.wav
+*.m4a
+*.opus
+*.mp3
+
+# DLQ files
+dlq/
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Tests
+tests/
+test_*.py
+
+# Next.js (separate deployment)
+sisi-nextjs/
+sisi.html
+
+# Scripts (not needed in production)
+scripts/
+
+# Migrations (run separately)
+migrations/
+
+# AWS/Lambda files
+lambda_*.py
+lambda_deploy.sh
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# CI/CD
+.github/
+
