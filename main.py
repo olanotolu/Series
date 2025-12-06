@@ -40,7 +40,7 @@ def get_llm_response(text):
         # Using a reliable chat model
         response = client.chat_completion(
             messages=messages,
-            model="meta-llama/Meta-Llama-3-8B-Instruct",
+            model="meta-llama/Llama-3.2-3B-Instruct",
             max_tokens=512
         )
         return response.choices[0].message.content
