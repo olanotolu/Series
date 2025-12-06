@@ -1048,20 +1048,32 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
             except:
                 pass
         
-        if transcript:
+        # Start typing
+        await start_typing(session, chat_id)
+        
+        # Get user history and behavioral context
+        loop = asyncio.get_event_loop()
+        history = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_history, sender)
+        behavior_context = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.analyze_behavior, sender)
+        
+        print(f"   🧠 Behavioral Context: {behavior_context}")
+        
+        # If transcription failed, use a fallback message but still send voice response
+        if not transcript:
+            print(f"   ⚠️  Transcription failed, using fallback message for voice response")
+            transcript = "voice memo"  # Placeholder for context
+            detected_language = "en"  # Default to English
+            # Use a friendly fallback message
+            fallback_messages = {
+                "en": "Hey! I got your voice memo! Thanks for sending it.",
+                "hi": "नमस्ते! मुझे आपका वॉइस मेमो मिला! भेजने के लिए धन्यवाद।",
+                "fr": "Salut! J'ai reçu ton message vocal! Merci de l'avoir envoyé."
+            }
+            llm_reply = fallback_messages.get(detected_language, fallback_messages["en"])
+        else:
             lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
             lang_name = lang_names.get(detected_language, "Unknown")
             print(f"   ✅ STEP 5 COMPLETE: Transcript ({lang_names.get(detected_language, 'Unknown')}): {transcript}")
-            
-            # Start typing
-            await start_typing(session, chat_id)
-            
-            # Get user history and behavioral context
-            loop = asyncio.get_event_loop()
-            history = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_history, sender)
-            behavior_context = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.analyze_behavior, sender)
-            
-            print(f"   🧠 Behavioral Context: {behavior_context}")
             
             try:
                 if not transcript:
@@ -1080,73 +1092,87 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
                 llm_reply = await get_llm_response(transcript, history, language=detected_language or "en", behavior_context=behavior_context)
                 print(f"   ✅ STEP 6 COMPLETE: LLM Response ({lang_name}): {llm_reply[:100]}...")
                 
-                # SEND VOICE RESPONSE: Voice memo in → Voice memo out
-                # Convert LLM text to speech, then send as audio
-                print(f"   🔊 STEP 7: Converting LLM text → Speech (TTS, {lang_name})...")
-                tts_wav = await text_to_speech(llm_reply, language=detected_language or "en")
-                
-                if tts_wav and (os.path.exists(tts_wav) or tts_wav.startswith('s3://')):
-                    print(f"   ✅ STEP 7 COMPLETE: TTS WAV ready: {tts_wav}")
-                    
-                    # Convert WAV to M4A (AAC) for iMessage voice memo
-                    print(f"   🎵 STEP 8: Converting TTS WAV → M4A (AAC)...")
-                    loop = asyncio.get_event_loop()
-                    m4a_file = await loop.run_in_executor(
-                        CPU_BOUND_EXECUTOR, 
-                        wav_to_m4a, 
-                        tts_wav
-                    )
-                    
-                    if m4a_file and (os.path.exists(m4a_file) or m4a_file.startswith('s3://')):
-                        print(f"   ✅ STEP 8 COMPLETE: M4A file ready: {m4a_file}")
-                        # Send voice response (with text transcript for API requirement)
-                        print(f"   📤 STEP 9: Sending VOICE response (voice memo in → voice memo out)...")
-                        await send_audio(session, chat_id, m4a_file, text=llm_reply)
-                        print(f"   ✅ STEP 9 COMPLETE: Voice response sent!")
-                    else:
-                        # Retry: Try sending WAV directly if M4A conversion fails
-                        print(f"   ⚠️  M4A conversion failed, trying to send WAV directly...")
-                        try:
-                            await send_audio(session, chat_id, tts_wav, text=llm_reply)
-                            print(f"   ✅ Voice response sent as WAV!")
-                        except:
-                            # Last resort: Send text only if audio completely fails
-                            print(f"   ❌ Audio send failed, sending text as last resort")
-                            await send_text(session, chat_id, f"🎤 {llm_reply}")
-                else:
-                    # Last resort: Send text only if TTS completely fails
-                    print(f"   ❌ TTS failed completely, sending text as last resort")
-                    await send_text(session, chat_id, f"🎤 {llm_reply}")
-                
-                # Save context (run in executor)
-                def save_context():
-                    session_manager.add_message(sender, "user", transcript)
-                    session_manager.add_message(sender, "assistant", llm_reply)
-                await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_context)
-                
             except Exception as e:
                 print(f"   ⚠️  LLM error: {e}")
-                # Even on error, try to send voice response if possible
-                # Fallback to text only if voice completely fails
-                try:
-                    error_tts = await text_to_speech(f"I heard: {transcript}", language=detected_language or "en")
-                    if error_tts:
-                        m4a_file = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, error_tts)
-                        if m4a_file:
-                            await send_audio(session, chat_id, m4a_file, text=f"🎤 I heard: {transcript}")
-                        else:
-                            await send_text(session, chat_id, f"🎤 I heard: {transcript}")
-                    else:
-                        await send_text(session, chat_id, f"🎤 I heard: {transcript}")
-                except:
-                    await send_text(session, chat_id, f"🎤 I heard: {transcript}")
+                # Use fallback message
+                fallback_messages = {
+                    "en": f"I heard your voice memo! Thanks for sending it.",
+                    "hi": f"मैंने आपका वॉइस मेमो सुना! भेजने के लिए धन्यवाद।",
+                    "fr": f"J'ai entendu ton message vocal! Merci de l'avoir envoyé."
+                }
+                llm_reply = fallback_messages.get(detected_language or "en", fallback_messages["en"])
+        
+        # SEND VOICE RESPONSE: Voice memo in → Voice memo out (ALWAYS)
+        # Convert response text to speech, then send as audio
+        print(f"   🔊 STEP 7: Converting response text → Speech (TTS, {detected_language or 'en'})...")
+        tts_wav = await text_to_speech(llm_reply, language=detected_language or "en")
+        
+        if tts_wav and (os.path.exists(tts_wav) or tts_wav.startswith('s3://')):
+            print(f"   ✅ STEP 7 COMPLETE: TTS WAV ready: {tts_wav}")
             
-            await stop_typing(session, chat_id)
-        else:
-            if use_s3:
-                await send_text(session, chat_id, f"🎤 Got your voice memo! Saved to S3")
+            # Convert WAV to M4A (AAC) for iMessage voice memo
+            print(f"   🎵 STEP 8: Converting TTS WAV → M4A (AAC)...")
+            loop = asyncio.get_event_loop()
+            m4a_file = await loop.run_in_executor(
+                CPU_BOUND_EXECUTOR, 
+                wav_to_m4a, 
+                tts_wav
+            )
+            
+            if m4a_file and (os.path.exists(m4a_file) or m4a_file.startswith('s3://')):
+                print(f"   ✅ STEP 8 COMPLETE: M4A file ready: {m4a_file}")
+                # Send voice response (with text transcript for API requirement)
+                print(f"   📤 STEP 9: Sending VOICE response (voice memo in → voice memo out)...")
+                await send_audio(session, chat_id, m4a_file, text=llm_reply)
+                print(f"   ✅ STEP 9 COMPLETE: Voice response sent!")
             else:
-                await send_text(session, chat_id, f"🎤 Got your voice memo! Saved locally")
+                # Retry: Try sending WAV directly if M4A conversion fails
+                print(f"   ⚠️  M4A conversion failed, trying to send WAV directly...")
+                try:
+                    await send_audio(session, chat_id, tts_wav, text=llm_reply)
+                    print(f"   ✅ Voice response sent as WAV!")
+                except Exception as e:
+                    # Retry TTS generation if audio send fails
+                    print(f"   ⚠️  Audio send failed, retrying TTS generation...")
+                    try:
+                        # Retry with a simpler message
+                        retry_tts = await text_to_speech("Got your voice memo!", language=detected_language or "en")
+                        if retry_tts:
+                            retry_m4a = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, retry_tts)
+                            if retry_m4a:
+                                await send_audio(session, chat_id, retry_m4a, text="Got your voice memo!")
+                                print(f"   ✅ Voice response sent after retry!")
+                            else:
+                                print(f"   ❌ All audio attempts failed - voice memo cannot be sent")
+                        else:
+                            print(f"   ❌ TTS retry failed - voice memo cannot be sent")
+                    except Exception as retry_error:
+                        print(f"   ❌ All voice response attempts failed: {retry_error}")
+        else:
+            # Retry TTS generation once
+            print(f"   ⚠️  TTS failed, retrying once...")
+            try:
+                retry_tts = await text_to_speech("Got your voice memo!", language=detected_language or "en")
+                if retry_tts:
+                    retry_m4a = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, retry_tts)
+                    if retry_m4a:
+                        await send_audio(session, chat_id, retry_m4a, text="Got your voice memo!")
+                        print(f"   ✅ Voice response sent after retry!")
+                    else:
+                        print(f"   ❌ All audio attempts failed - voice memo cannot be sent")
+                else:
+                    print(f"   ❌ TTS retry failed - voice memo cannot be sent")
+            except Exception as retry_error:
+                print(f"   ❌ All voice response attempts failed: {retry_error}")
+        
+        # Save context (run in executor) - only if we have a real transcript
+        if transcript and transcript != "voice memo":
+            def save_context():
+                session_manager.add_message(sender, "user", transcript)
+                session_manager.add_message(sender, "assistant", llm_reply)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_context)
+        
+        await stop_typing(session, chat_id)
         
         # Cleanup temp files (if local and not the final wav_filename)
         if not use_s3 and 'wav_file' in locals() and os.path.exists(wav_file) and wav_file != wav_filename:
@@ -1158,7 +1184,21 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
     except Exception as e:
         print(f"   ❌ Error processing audio: {e}")
         traceback.print_exc()
-        await send_text(session, chat_id, "Sorry, couldn't process that voice memo.")
+        # Try to send a voice response even on error (voice in → voice out)
+        try:
+            error_tts = await text_to_speech("Sorry, couldn't process that voice memo.", language="en")
+            if error_tts:
+                error_m4a = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, error_tts)
+                if error_m4a:
+                    await send_audio(session, chat_id, error_m4a, text="Sorry, couldn't process that voice memo.")
+                    print(f"   ✅ Error voice response sent")
+                else:
+                    print(f"   ❌ Could not send error voice response")
+            else:
+                print(f"   ❌ Could not generate error voice response")
+        except Exception as voice_error:
+            print(f"   ❌ Could not send voice error response: {voice_error}")
+            # Do NOT send text - voice in must only respond with voice
 
 
 async def process_text_message(session: aiohttp.ClientSession, event_data: dict):
