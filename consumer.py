@@ -221,6 +221,112 @@ async def transcribe_audio(filename: str, language: str = None) -> tuple:
         return None, None
 
 
+def _generate_contextual_fallback(text: str, history: list = None, language: str = "en", is_error: bool = False) -> str:
+    """Generate a contextual fallback response based on user's message and conversation history.
+    This provides varied, appropriate responses when the LLM fails."""
+    text_lower = text.lower().strip()
+    
+    # Check conversation history for context
+    last_user_msg = None
+    if history:
+        # Find last user message (not AI)
+        for msg in reversed(history):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last_user_msg = msg.get("content", "").lower()
+                break
+    
+    # Pattern matching for common greetings
+    greetings = ["hi", "hey", "hello", "sup", "what's up", "howdy"]
+    if any(text_lower.startswith(g) or text_lower == g for g in greetings):
+        responses = {
+            "en": ["Hey there! 👋", "Hi! What's up?", "Hello! How can I help?", "Hey! Good to hear from you."],
+            "hi": ["नमस्ते! 👋", "हैलो! क्या हाल है?", "नमस्कार! कैसे हो?"],
+            "fr": ["Salut! 👋", "Bonjour! Comment ça va?", "Salut! Quoi de neuf?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Questions about how they are
+    if any(word in text_lower for word in ["how are you", "how are u", "hbu", "how's it going", "how r u"]):
+        responses = {
+            "en": ["I'm doing well, thanks for asking! How about you?", "Pretty good! What's new with you?", "All good here! How are things on your end?"],
+            "hi": ["मैं ठीक हूँ, पूछने के लिए धन्यवाद! आप कैसे हैं?", "बहुत अच्छा! आपके साथ क्या नया है?"],
+            "fr": ["Je vais bien, merci de demander! Et toi?", "Plutôt bien! Quoi de neuf avec toi?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Questions
+    if text_lower.endswith("?") or any(word in text_lower for word in ["what", "when", "where", "why", "how", "who"]):
+        responses = {
+            "en": ["That's a good question! Let me think about that...", "Hmm, interesting question. What do you think?", "I'm not entirely sure, but what's your take on it?"],
+            "hi": ["यह एक अच्छा सवाल है! मुझे इसके बारे में सोचने दो...", "हम्म, दिलचस्प सवाल। आप क्या सोचते हैं?"],
+            "fr": ["C'est une bonne question! Laisse-moi réfléchir...", "Hmm, question intéressante. Qu'est-ce que tu en penses?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Short responses (yes, no, ok, etc.)
+    short_responses = ["yes", "yeah", "yep", "no", "nope", "ok", "okay", "sure", "cool", "nice", "good"]
+    if text_lower in short_responses or len(text_lower) <= 3:
+        responses = {
+            "en": ["Got it! What else is on your mind?", "Cool! Tell me more.", "Nice! What's next?", "Alright! What's up?"],
+            "hi": ["समझ गया! और क्या है?", "ठीक है! और बताओ।", "अच्छा! आगे क्या?"],
+            "fr": ["Compris! Quoi d'autre?", "Cool! Dis-moi en plus.", "Bien! Et ensuite?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Statements or longer messages - acknowledge and engage
+    if len(text_lower) > 10:
+        # Try to extract key topics
+        common_words = ["work", "school", "job", "class", "homework", "project", "meeting", "weekend", "plans", "today", "tomorrow"]
+        found_topic = None
+        for word in common_words:
+            if word in text_lower:
+                found_topic = word
+                break
+        
+        if found_topic:
+            topic_responses = {
+                "work": {"en": "Work stuff, huh? How's that going?", "hi": "काम की बातें, है ना? कैसा चल रहा है?", "fr": "Des trucs de boulot, hein? Comment ça se passe?"},
+                "school": {"en": "School! How are classes going?", "hi": "स्कूल! कक्षाएं कैसी चल रही हैं?", "fr": "L'école! Comment se passent les cours?"},
+                "job": {"en": "Job stuff! What's happening there?", "hi": "नौकरी की बातें! वहाँ क्या हो रहा है?", "fr": "Des trucs de boulot! Qu'est-ce qui se passe là-bas?"},
+                "weekend": {"en": "Weekend plans! What are you up to?", "hi": "सप्ताहांत की योजनाएं! आप क्या कर रहे हैं?", "fr": "Des plans de week-end! Qu'est-ce que tu fais?"},
+                "plans": {"en": "Plans! What are you thinking?", "hi": "योजनाएं! आप क्या सोच रहे हैं?", "fr": "Des plans! À quoi tu penses?"}
+            }
+            if found_topic in topic_responses:
+                return topic_responses[found_topic].get(language, topic_responses[found_topic]["en"])
+        
+        # Generic acknowledgment for longer messages
+        responses = {
+            "en": ["That's interesting! Tell me more about that.", "I see! What's your take on it?", "Gotcha! How do you feel about that?", "Interesting point! What else is on your mind?"],
+            "hi": ["यह दिलचस्प है! मुझे इसके बारे में और बताओ।", "समझ गया! आप इसके बारे में क्या सोचते हैं?", "ठीक है! आप इसके बारे में कैसा महसूस करते हैं?"],
+            "fr": ["C'est intéressant! Dis-moi en plus.", "Je vois! Qu'est-ce que tu en penses?", "Compris! Comment tu te sens à ce sujet?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Error fallback (when LLM completely fails)
+    if is_error:
+        responses = {
+            "en": ["Sorry, I'm having a bit of trouble right now. Can you try rephrasing that?", "Oops! Having some technical difficulties. What were you saying?", "Hmm, something's not working right. Can you say that again?"],
+            "hi": ["माफ करें, मुझे अभी थोड़ी परेशानी हो रही है। क्या आप इसे फिर से कह सकते हैं?", "ओह! कुछ तकनीकी समस्याएं हो रही हैं। आप क्या कह रहे थे?"],
+            "fr": ["Désolé, j'ai un petit problème en ce moment. Peux-tu reformuler?", "Oups! Quelques difficultés techniques. Qu'est-ce que tu disais?"]
+        }
+        import random
+        return random.choice(responses.get(language, responses["en"]))
+    
+    # Default fallback
+    responses = {
+        "en": ["Got it! What's on your mind?", "I hear you! What else?", "Interesting! Tell me more.", "Cool! What's next?"],
+        "hi": ["समझ गया! आप क्या सोच रहे हैं?", "सुन रहा हूँ! और क्या?", "दिलचस्प! और बताओ।"],
+        "fr": ["Compris! Qu'est-ce qui te passe par la tête?", "Je t'entends! Quoi d'autre?", "Intéressant! Dis-moi en plus."]
+    }
+    import random
+    return random.choice(responses.get(language, responses["en"]))
+
+
 async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "", profile: dict = None, group_context: dict = None) -> str:
     """Get response from LLM using Hugging Face Inference API.
     Responds in the detected language (English, Hindi, or French).
@@ -455,13 +561,10 @@ You can use emojis occasionally to add personality, but don't overdo it. Be your
             reply = ""
         
         if not reply or len(reply) < 3:
-            print(f"   ⚠️  Empty or too short reply, using fallback")
-            fallbacks = {
-                "en": f"Hey! 👋 How's it going?",
-                "hi": f"नमस्ते! 👋 कैसे हो?",
-                "fr": f"Salut! 👋 Comment ça va?"
-            }
-            return fallbacks.get(language, fallbacks["en"])
+            print(f"   ⚠️  Empty or too short reply, using contextual fallback")
+            # Generate contextual fallback based on user's message
+            contextual_fallback = _generate_contextual_fallback(text, history, language)
+            return contextual_fallback
         
         # Validate language match - if LLM responded in wrong language, use fallback
         detected_reply_lang = await detect_language(reply)
@@ -481,13 +584,9 @@ You can use emojis occasionally to add personality, but don't overdo it. Be your
         print(f"   ❌ LLM error: {e}")
         print(f"   ❌ Error type: {type(e).__name__}")
         traceback.print_exc()
-        # Use friendly fallback instead of repeating user message
-        fallbacks = {
-            "en": f"Hey! 👋 Sorry, I'm having a bit of trouble right now. What's on your mind?",
-            "hi": f"नमस्ते! 👋 माफ करें, मुझे अभी थोड़ी परेशानी हो रही है। आप क्या सोच रहे हैं?",
-            "fr": f"Salut! 👋 Désolé, j'ai un petit problème en ce moment. Qu'est-ce qui te passe par la tête?"
-        }
-        return fallbacks.get(language, fallbacks["en"])
+        # Use contextual fallback based on user's message
+        contextual_fallback = _generate_contextual_fallback(text, history, language, is_error=True)
+        return contextual_fallback
 
 
 async def text_to_speech(text: str, language: str = "en", output_file: str = None) -> str:
@@ -1186,9 +1285,10 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
         traceback.print_exc()
         # Try to send a voice response even on error (voice in → voice out)
         try:
+            error_loop = asyncio.get_event_loop()
             error_tts = await text_to_speech("Sorry, couldn't process that voice memo.", language="en")
             if error_tts:
-                error_m4a = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, error_tts)
+                error_m4a = await error_loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, error_tts)
                 if error_m4a:
                     await send_audio(session, chat_id, error_m4a, text="Sorry, couldn't process that voice memo.")
                     print(f"   ✅ Error voice response sent")
