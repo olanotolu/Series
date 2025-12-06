@@ -34,7 +34,8 @@ from opus_to_wav import opus_to_wav
 from dlq_handler import send_to_dlq, classify_error, is_recoverable_error
 from onboarding_flow import (
     get_onboarding_greeting, get_question, get_next_state,
-    validate_answer, get_completion_message, format_profile_summary
+    validate_answer, get_completion_message, format_profile_summary,
+    extract_value
 )
 
 # Session Manager (Supabase) - optional
@@ -955,30 +956,38 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             await stop_typing(session, chat_id)
             return
         
+        # Extract the actual value from the answer (e.g., "my name is siddharth" -> "siddharth")
+        extracted_value = extract_value(onboarding_state, text)
+        
         # Save answer
         profile_update = {}
         if onboarding_state == "name":
-            profile_update["name"] = text.strip()
+            profile_update["name"] = extracted_value
         elif onboarding_state == "school":
-            profile_update["school"] = text.strip()
+            profile_update["school"] = extracted_value
         elif onboarding_state == "age":
-            profile_update["age"] = int(text.strip())
+            profile_update["age"] = int(extracted_value)
         elif onboarding_state == "hobbies":
-            profile_update["hobbies"] = text.strip()
+            profile_update["hobbies"] = extracted_value
         
-        # Update profile
-        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.update_profile, sender, **profile_update)
+        # Update profile (wrap in lambda to handle kwargs)
+        def update_profile_wrapper():
+            session_manager.update_profile(sender, **profile_update)
+        await loop.run_in_executor(CPU_BOUND_EXECUTOR, update_profile_wrapper)
         
         # Move to next state
         next_state = get_next_state(onboarding_state)
         
         if next_state == "complete":
-            # Mark onboarding complete
-            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.update_profile, sender, onboarding_complete=True, onboarding_state="complete")
+            # Mark onboarding complete (wrap in function to handle kwargs)
+            def complete_onboarding():
+                session_manager.update_profile(sender, onboarding_complete=True, onboarding_state="complete")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, complete_onboarding)
             profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
             completion_msg = get_completion_message(profile)
             await send_text(session, chat_id, completion_msg)
             await stop_typing(session, chat_id)
+            print(f"   ✅ Onboarding complete! Profile saved: {profile}")
             return
         else:
             # Ask next question
@@ -1105,8 +1114,12 @@ async def consume():
                     messages_available = latest_offset - committed_offset
                     print(f"      ⚠️  {messages_available} message(s) available between committed and latest!")
                     # Seek to committed position to process those messages
-                    await consumer.seek(partition, committed_offset)
-                    print(f"      ✅ Seeking to committed offset {committed_offset} to process available messages")
+                    if committed_offset is not None:
+                        await consumer.seek(partition, committed_offset)
+                        print(f"      ✅ Seeking to committed offset {committed_offset} to process available messages")
+                    else:
+                        await consumer.seek_to_end(partition)
+                        print(f"      ✅ No valid committed offset, positioned at latest")
                 elif committed_offset < 0 and latest_offset > beginning_offset:
                     # No committed offset, but there are messages - process from beginning to catch up
                     messages_available = latest_offset - beginning_offset
@@ -1163,8 +1176,12 @@ async def consume():
                 # Poll for messages with timeout
                 try:
                     msg_pack = await consumer.getmany(timeout_ms=1000, max_records=10)
+                    if msg_pack:
+                        print(f"   📦 Received {sum(len(msgs) for msgs in msg_pack.values())} message(s) from Kafka")
                 except Exception as e:
                     print(f"   ⚠️  Error polling messages: {e}")
+                    import traceback
+                    traceback.print_exc()
                     await asyncio.sleep(1)
                     continue
                 
@@ -1189,7 +1206,8 @@ async def consume():
                                         
                                         pos_info.append(f"P{p.partition}:{pos}")
                                         if latest > pos:
-                                            offset_info.append(f"P{p.partition}: {latest-pos} msgs ahead")
+                                            offset_info.append(f"P{p.partition}: {latest-pos} msgs ahead ⚠️")
+                                            print(f"   ⚠️  WARNING: Partition {p.partition} has {latest-pos} unprocessed message(s)! Current: {pos}, Latest: {latest}")
                                     except Exception as e:
                                         pos_info.append(f"P{p.partition}:?")
                                 
@@ -1295,6 +1313,9 @@ async def consume():
                             elif "text" in data and data.get("text", "").strip():
                                 # Process text synchronously to ensure commit happens after success
                                 print(f"   💬 Processing as TEXT message...")
+                                print(f"   📝 Text: '{data.get('text', '')[:100]}'")
+                                print(f"   📞 From: {data.get('from_phone', 'Unknown')}")
+                                print(f"   💬 Chat ID: {data.get('chat_id', 'Unknown')}")
                                 try:
                                     await process_text_message(session, data)
                                     await consumer.commit()
