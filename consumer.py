@@ -44,25 +44,79 @@ KAFKA_SASL_USERNAME = os.getenv('KAFKA_SASL_USERNAME')
 KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD')
 
 # Initialize Kafka consumer
-# Using a unique consumer group to avoid offset issues
-UNIQUE_GROUP = f"{CONSUMER_GROUP}-{int(time.time())}"  # Fresh group each restart
+# Use stable consumer group for reliable offset tracking
+# We'll seek to end on startup to skip old messages, then commit that position
+UNIQUE_GROUP = CONSUMER_GROUP  # Stable group for reliable message tracking
 
 consumer = KafkaConsumer(
     TOPIC_NAME,
     bootstrap_servers=[BOOTSTRAP_SERVERS],
-    group_id=UNIQUE_GROUP,  # Fresh group = see all new messages
+    group_id=UNIQUE_GROUP,
     client_id=CLIENT_ID,
     security_protocol='SASL_SSL',
     sasl_mechanism='PLAIN',
     sasl_plain_username=KAFKA_SASL_USERNAME,
     sasl_plain_password=KAFKA_SASL_PASSWORD,
-    auto_offset_reset='latest',  # Only get messages sent AFTER consumer starts
-    enable_auto_commit=True,
-    value_deserializer=lambda v: json.loads(v.decode('utf-8'))
-    # No consumer_timeout_ms = wait forever for messages
+    auto_offset_reset='latest',  # Default to latest if no committed offset
+    enable_auto_commit=False,  # Manual commits for reliability - commit after each message
+    auto_commit_interval_ms=0,  # Disable auto-commit
+    session_timeout_ms=30000,  # 30 seconds
+    heartbeat_interval_ms=10000,  # 10 seconds - keep connection alive
+    max_poll_records=1,  # Process 1 message at a time for immediate commits
+    max_poll_interval_ms=300000,  # 5 minutes max processing time
+    value_deserializer=lambda v: json.loads(v.decode('utf-8')),
+    fetch_min_bytes=1,  # Return immediately when data is available
+    fetch_max_wait_ms=100,  # Wait up to 100ms for data - faster response
+    request_timeout_ms=40000,  # 40 seconds - must be > session_timeout_ms
+    retry_backoff_ms=100  # Fast retry on errors
 )
 
 headers = {"Authorization": f"Bearer {API_KEY}"}
+
+# Explicitly seek to end of all partitions to only read NEW messages
+# Then commit that position so we don't re-read old messages on restart
+print("⏩ Seeking to end of all partitions (ONLY NEW MESSAGES - skipping history)...")
+try:
+    # Poll to trigger partition assignment
+    consumer.poll(timeout_ms=3000)
+    # Wait for assignment to complete
+    time.sleep(1)
+    
+    if consumer.assignment():
+        total_skipped = 0
+        for partition in consumer.assignment():
+            # Get current position before seeking
+            try:
+                # Try to get the beginning offset to see how many messages exist
+                beginning_offset = consumer.beginning_offsets([partition])[partition]
+                end_offset_before = consumer.position(partition)
+            except:
+                beginning_offset = None
+                end_offset_before = None
+            
+            # Seek to end - this skips all old messages
+            consumer.seek_to_end(partition)
+            end_offset = consumer.position(partition)
+            
+            if beginning_offset is not None and end_offset_before is not None:
+                skipped = end_offset - beginning_offset
+                total_skipped += skipped
+                print(f"   📍 Partition {partition.partition}: offset {end_offset} (skipped {skipped} old messages)")
+            else:
+                print(f"   📍 Partition {partition.partition}: positioned at offset {end_offset} (end)")
+        
+        # Commit the end position so we don't re-read old messages on restart
+        consumer.commit()
+        if total_skipped > 0:
+            print(f"   ✅ Committed end position - skipped {total_skipped} old messages")
+        print("   ✅ Will ONLY process NEW messages that arrive after this point")
+    else:
+        print("   ⚠️  No partitions assigned yet, will seek on first message")
+except Exception as e:
+    print(f"   ⚠️  Error seeking to end: {e}")
+    import traceback
+    traceback.print_exc()
+    print("   Continuing anyway - will process from latest offset")
 
 # Initialize Hugging Face Inference API client
 HF_TOKEN = os.getenv('HF_TOKEN', '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')
@@ -127,8 +181,15 @@ def get_llm_response(text: str) -> str:
     try:
         print(f"   🤖 Getting LLM response via Inference API...")
         
-        # Construct messages for chat completion
+        # System prompt: Act like a friend on Series.so social network
+        system_prompt = """You are a friendly, helpful friend chatting on Series.so, a social network platform. 
+You're having a casual conversation with someone you know. Be warm, engaging, and natural in your responses.
+Keep responses concise (1-3 sentences typically), use casual language, and show genuine interest in the conversation.
+You can use emojis occasionally to add personality, but don't overdo it. Be yourself - friendly, supportive, and authentic."""
+        
+        # Construct messages for chat completion with system prompt
         messages = [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": text}
         ]
         
@@ -400,119 +461,177 @@ print("=" * 60)
 print("💡 Consumer is ready! Send a message from your phone to +16463769330")
 print("💡 Or test with: python producer.py 'Test message'")
 print("=" * 60)
+print("🔄 Waiting for messages... (this will block until a message arrives)")
+print("")
 
 message_count = 0
+last_heartbeat = time.time()
 
 try:
-    for msg in consumer:
-        message_count += 1
-        event = msg.value
+    while True:
+        # Use poll() for seamless real-time message processing
+        # Short timeout for immediate response to new messages
+        msg_pack = consumer.poll(timeout_ms=100, max_records=1)
         
-        # Show event header
-        event_type = event.get("event_type")
-        data = event.get("data", {})
-        created_at = event.get("created_at", "N/A")
+        if not msg_pack:
+            # No messages - check connection health
+            current_time = time.time()
+            if current_time - last_heartbeat > 30:
+                # Log heartbeat every 30 seconds to show we're alive
+                print(f"💓 Consumer heartbeat - waiting for messages... (processed {message_count} so far)")
+                last_heartbeat = current_time
+            continue
         
-        print(f"\n{'='*60}")
-        print(f"📨 EVENT #{message_count} - {event_type.upper()}")
-        print(f"{'='*60}")
-        print(f"⏰ Time: {created_at}")
-        print(f"📊 Kafka: Partition {msg.partition}, Offset {msg.offset}")
-        print(f"{'='*60}")
-        
-        if event_type == "message.received":
-            # Debug: Show all keys in data
-            print(f"🔍 DEBUG: Data keys: {list(data.keys())}")
-            
-            # Check if it's audio or text
-            # Audio can be in data directly, nested, or in attachments
-            has_audio = False
-            audio_data_to_process = None
-            
-            # Check multiple possible locations for audio
-            if "audio" in data:
-                has_audio = True
-                audio_data_to_process = data
-                print("   ✅ Found audio in data.audio")
-            elif isinstance(data.get("message"), dict) and "audio" in data.get("message", {}):
-                has_audio = True
-                audio_data_to_process = data.copy()
-                audio_data_to_process["audio"] = data["message"]["audio"]
-                print("   ✅ Found audio in data.message.audio")
-            elif isinstance(data.get("attachments"), list) and len(data.get("attachments", [])) > 0:
-                # Check if audio is in attachments array
-                print(f"   🔍 Checking {len(data['attachments'])} attachment(s)...")
-                for i, att in enumerate(data.get("attachments", [])):
-                    print(f"      Attachment {i+1}: {type(att)}, keys: {list(att.keys()) if isinstance(att, dict) else 'not a dict'}")
-                    if isinstance(att, dict):
-                        # Check various ways audio might be represented
-                        is_audio = (
-                            att.get("type") == "audio" or 
-                            att.get("mime_type", "").startswith("audio/") or
-                            att.get("filename", "").endswith((".opus", ".wav", ".m4a", ".aac", ".mp3"))
-                        )
+        # Process all messages in this batch
+        for topic_partition, messages in msg_pack.items():
+            for msg in messages:
+                message_count += 1
+                msg_offset = msg.offset
+                msg_partition = msg.partition
+                
+                # Wrap each message in try/except so one bad message doesn't stop processing
+                try:
+                    event = msg.value
+                    
+                    # Show event header
+                    event_type = event.get("event_type") if isinstance(event, dict) else None
+                    data = event.get("data", {}) if isinstance(event, dict) else {}
+                    created_at = event.get("created_at", "N/A") if isinstance(event, dict) else "N/A"
+                    
+                    print(f"\n{'='*60}")
+                    print(f"📨 EVENT #{message_count} - {event_type.upper() if event_type else 'UNKNOWN'}")
+                    print(f"{'='*60}")
+                    print(f"⏰ Time: {created_at}")
+                    print(f"📊 Kafka: Partition {msg_partition}, Offset {msg_offset}")
+                    print(f"🔍 Raw event keys: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
+                    print(f"{'='*60}")
+                    
+                    # Handle case where event_type is missing
+                    if not event_type:
+                        print("⚠️  WARNING: Event missing 'event_type' field!")
+                        print(f"   Full event structure: {json.dumps(event, indent=2)}")
+                        print(f"{'='*60}\n")
+                        # Commit offset automatically - kafka-python tracks the last consumed offset
+                        consumer.commit()
+                        continue
+                    
+                    if event_type == "message.received":
+                        # Debug: Show all keys in data
+                        print(f"🔍 DEBUG: Data keys: {list(data.keys())}")
                         
-                        if is_audio:
+                        # Check if it's audio or text
+                        # Audio can be in data directly, nested, or in attachments
+                        has_audio = False
+                        audio_data_to_process = None
+                        
+                        # Check multiple possible locations for audio
+                        if "audio" in data:
+                            has_audio = True
+                            audio_data_to_process = data
+                            print("   ✅ Found audio in data.audio")
+                        elif isinstance(data.get("message"), dict) and "audio" in data.get("message", {}):
                             has_audio = True
                             audio_data_to_process = data.copy()
-                            # Map attachment to audio structure (include URL for downloading)
-                            audio_data_to_process["audio"] = {
-                                "format": att.get("format", "opus"),
-                                "sample_rate": att.get("sample_rate", 16000),
-                                "channels": att.get("channels", 1),
-                                "data": att.get("data") or att.get("content") or att.get("base64_data"),
-                                "url": att.get("url")  # Include URL for downloading
-                            }
-                            print(f"   ✅ Found audio in data.attachments[{i}]")
-                            if att.get("url"):
-                                print(f"      Audio URL: {att['url'][:60]}...")
-                            break
-                        elif "data" in att or "content" in att or "base64_data" in att:
-                            # Might be audio even without explicit type
-                            has_audio = True
-                            audio_data_to_process = data.copy()
-                            audio_data_to_process["audio"] = {
-                                "format": att.get("format", "opus"),
-                                "sample_rate": att.get("sample_rate", 16000),
-                                "channels": att.get("channels", 1),
-                                "data": att.get("data") or att.get("content") or att.get("base64_data"),
-                                "url": att.get("url")
-                            }
-                            print(f"   ✅ Found audio-like data in data.attachments[{i}]")
-                            break
-            
-            if has_audio and audio_data_to_process:
-                print("🎤 Audio message detected")
-                process_audio_message(audio_data_to_process)
-            elif "text" in data and data.get("text"):
-                process_text_message(data)
-            else:
-                print("⚠️  Unknown message format - showing full structure:")
-                print(f"   Full data: {json.dumps(data, indent=2)}")
-        
-        elif event_type == "typing_indicator.received":
-            chat_id = data.get("chat_id", "N/A")
-            display = data.get("display", False)
-            print(f"\n⌨️  TYPING INDICATOR:")
-            print(f"   Chat ID: {chat_id}")
-            print(f"   Status: {'User is typing...' if display else 'Stopped'}")
-            print(f"{'='*60}")
-        
-        elif event_type == "typing_indicator.removed":
-            chat_id = data.get("chat_id", "N/A")
-            print(f"\n⌨️  TYPING INDICATOR REMOVED:")
-            print(f"   Chat ID: {chat_id}")
-            print(f"   Status: User stopped typing")
-            print(f"{'='*60}")
-        
-        else:
-            print(f"\nℹ️  OTHER EVENT: {event_type}")
-            print(f"   Full event: {json.dumps(event, indent=2)}")
-            print(f"{'='*60}")
-        
-        # Summary line
-        print(f"✅ Event #{message_count} processed successfully")
-        print(f"{'='*60}\n")
+                            audio_data_to_process["audio"] = data["message"]["audio"]
+                            print("   ✅ Found audio in data.message.audio")
+                        elif isinstance(data.get("attachments"), list) and len(data.get("attachments", [])) > 0:
+                            # Check if audio is in attachments array
+                            print(f"   🔍 Checking {len(data['attachments'])} attachment(s)...")
+                            for i, att in enumerate(data.get("attachments", [])):
+                                print(f"      Attachment {i+1}: {type(att)}, keys: {list(att.keys()) if isinstance(att, dict) else 'not a dict'}")
+                                if isinstance(att, dict):
+                                    # Check various ways audio might be represented
+                                    is_audio = (
+                                        att.get("type") == "audio" or 
+                                        att.get("mime_type", "").startswith("audio/") or
+                                        att.get("filename", "").endswith((".opus", ".wav", ".m4a", ".aac", ".mp3"))
+                                    )
+                                    
+                                    if is_audio:
+                                        has_audio = True
+                                        audio_data_to_process = data.copy()
+                                        # Map attachment to audio structure (include URL for downloading)
+                                        audio_data_to_process["audio"] = {
+                                            "format": att.get("format", "opus"),
+                                            "sample_rate": att.get("sample_rate", 16000),
+                                            "channels": att.get("channels", 1),
+                                            "data": att.get("data") or att.get("content") or att.get("base64_data"),
+                                            "url": att.get("url")  # Include URL for downloading
+                                        }
+                                        print(f"   ✅ Found audio in data.attachments[{i}]")
+                                        if att.get("url"):
+                                            print(f"      Audio URL: {att['url'][:60]}...")
+                                        break
+                                    elif "data" in att or "content" in att or "base64_data" in att:
+                                        # Might be audio even without explicit type
+                                        has_audio = True
+                                        audio_data_to_process = data.copy()
+                                        audio_data_to_process["audio"] = {
+                                            "format": att.get("format", "opus"),
+                                            "sample_rate": att.get("sample_rate", 16000),
+                                            "channels": att.get("channels", 1),
+                                            "data": att.get("data") or att.get("content") or att.get("base64_data"),
+                                            "url": att.get("url")
+                                        }
+                                        print(f"   ✅ Found audio-like data in data.attachments[{i}]")
+                                        break
+                        
+                        if has_audio and audio_data_to_process:
+                            print("🎤 Audio message detected")
+                            process_audio_message(audio_data_to_process)
+                        elif "text" in data and data.get("text"):
+                            process_text_message(data)
+                        else:
+                            print("⚠️  Unknown message format - showing full structure:")
+                            print(f"   Full data: {json.dumps(data, indent=2)}")
+                    
+                    elif event_type == "typing_indicator.received":
+                        chat_id = data.get("chat_id", "N/A")
+                        display = data.get("display", False)
+                        print(f"\n⌨️  TYPING INDICATOR:")
+                        print(f"   Chat ID: {chat_id}")
+                        print(f"   Status: {'User is typing...' if display else 'Stopped'}")
+                        print(f"{'='*60}")
+                    
+                    elif event_type == "typing_indicator.removed":
+                        chat_id = data.get("chat_id", "N/A")
+                        print(f"\n⌨️  TYPING INDICATOR REMOVED:")
+                        print(f"   Chat ID: {chat_id}")
+                        print(f"   Status: User stopped typing")
+                        print(f"{'='*60}")
+                    
+                    else:
+                        print(f"\nℹ️  OTHER EVENT: {event_type}")
+                        print(f"   Full event: {json.dumps(event, indent=2)}")
+                        print(f"{'='*60}")
+                    
+                    # Summary line
+                    print(f"✅ Event #{message_count} processed successfully")
+                    print(f"{'='*60}\n")
+                    
+                    # CRITICAL: Commit offset IMMEDIATELY after successful processing
+                    # Using automatic commit - kafka-python tracks the last consumed offset
+                    # This ensures we never lose a message, even if the process crashes
+                    consumer.commit()
+                    print(f"   ✅ Offset {msg_offset} committed successfully")
+                
+                except Exception as e:
+                    # Error processing this specific message
+                    print(f"\n❌ ERROR processing message at offset {msg_offset}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    # Commit offset to skip this bad message and continue seamlessly
+                    # This prevents the consumer from getting stuck on bad messages
+                    print(f"   ⚠️  Committing offset to skip this message (may need manual review)")
+                    try:
+                        consumer.commit()
+                        print(f"   ✅ Offset {msg_offset} committed (skipping bad message)")
+                    except Exception as commit_error:
+                        print(f"   ❌ Failed to commit after error: {commit_error}")
+                        # This is bad - we might reprocess this message, but continue anyway
+                    print(f"{'='*60}\n")
+                    continue  # Continue processing next message seamlessly
 
 except KeyboardInterrupt:
     print(f"\n\n🛑 Consumer stopped")
