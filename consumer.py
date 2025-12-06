@@ -68,6 +68,14 @@ except ImportError:
     LANGDETECT_AVAILABLE = False
     print("⚠️  langdetect not installed. Install with: pip install langdetect")
 
+# Cartesia TTS
+try:
+    from cartesia_tts import generate_speech as cartesia_generate_speech
+    CARTESIA_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Cartesia integration error: {e}")
+    CARTESIA_AVAILABLE = False
+
 # Global objects
 headers = {"Authorization": f"Bearer {API_KEY}"}
 hf_client = None
@@ -217,69 +225,15 @@ IMPORTANT: Always respond in the same language the user is using. If they write 
 
 
 async def text_to_speech(text: str, language: str = "en", output_file: str = None) -> str:
-    """Convert text to speech using Hugging Face Inference API (TTS).
-    Supports English, Hindi, and French."""
-    global hf_client
+    """Convert text to speech using Cartesia API."""
     
-    if not HF_AVAILABLE or hf_client is None:
-        if not await init_hf_client():
-            return None
+    if not CARTESIA_AVAILABLE:
+        print("   ❌ Cartesia TTS not available")
+        return None
     
     try:
         lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
-        print(f"   🔊 Converting text to speech ({lang_names.get(language, 'Unknown')}): {text[:50]}...")
-        
-        # Language-specific TTS models
-        tts_models_by_lang = {
-            "en": [
-                "microsoft/speecht5_tts",  # Good for English
-                "facebook/mms-tts",        # Multilingual, works well for English
-                "espnet/kan-bayashi_ljspeech_vits"
-            ],
-            "hi": [
-                "facebook/mms-tts",        # Supports Hindi
-                "microsoft/speecht5_tts"   # Fallback
-            ],
-            "fr": [
-                "facebook/mms-tts",        # Supports French
-                "microsoft/speecht5_tts"   # Fallback
-            ]
-        }
-        
-        # Get models for this language, with fallback to English models
-        models_to_try = tts_models_by_lang.get(language, tts_models_by_lang["en"])
-        if language != "en":
-            models_to_try.extend(tts_models_by_lang["en"])  # Add English as fallback
-        
-        audio_bytes = None
-        for model in models_to_try:
-            try:
-                response = await hf_client.text_to_speech(
-                    text,
-                    model=model
-                )
-                
-                # Extract audio bytes from response
-                if hasattr(response, 'content'):
-                    audio_bytes = response.content
-                elif isinstance(response, bytes):
-                    audio_bytes = response
-                elif hasattr(response, 'audio'):
-                    audio_bytes = response.audio
-                else:
-                    # Try to convert to bytes
-                    audio_bytes = bytes(response)
-                
-                if audio_bytes:
-                    print(f"   ✅ TTS generated using {model} ({lang_names.get(language, 'Unknown')})")
-                    break
-            except Exception as e:
-                print(f"   ⚠️  TTS model {model} failed: {e}")
-                continue
-        
-        if not audio_bytes:
-            print(f"   ❌ All TTS models failed for {lang_names.get(language, 'Unknown')}")
-            return None
+        print(f"   🔊 Generating Speech (Cartesia): {text[:50]}...")
         
         # Save audio to file
         if output_file is None:
@@ -288,13 +242,16 @@ async def text_to_speech(text: str, language: str = "en", output_file: str = Non
         
         os.makedirs("audio_files", exist_ok=True)
         
-        # Write audio bytes to file
-        with open(output_file, 'wb') as f:
-            f.write(audio_bytes)
+        # Call Cartesia
+        result_file = await cartesia_generate_speech(text, output_file)
         
-        print(f"   ✅ TTS audio saved: {output_file} ({len(audio_bytes)} bytes)")
-        return output_file
-        
+        if result_file and os.path.exists(result_file):
+            print(f"   ✅ TTS audio saved: {result_file}")
+            return result_file
+        else:
+            print(f"   ❌ TTS failed (no file created)")
+            return None
+            
     except Exception as e:
         print(f"   ⚠️  TTS error: {e}")
         traceback.print_exc()
