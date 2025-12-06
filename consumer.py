@@ -336,13 +336,8 @@ async def get_llm_response(text: str, history: list = None, language: str = "en"
     
     if hf_client is None:
         if not await init_hf_client():
-            print(f"   ❌ HF client initialization failed, using friendly fallback")
-            fallbacks = {
-                "en": f"Hey! 👋 Nice to hear from you!",
-                "hi": f"नमस्ते! 👋 आपसे बात करके अच्छा लगा!",
-                "fr": f"Salut! 👋 Ravi de te parler!"
-            }
-            return fallbacks.get(language, fallbacks["en"])
+            print(f"   ❌ HF client initialization failed, using contextual fallback")
+            return _generate_contextual_fallback(text, history, language, is_error=True)
     
     try:
         print(f"   🤖 Getting LLM response via Async Inference API...")
@@ -2113,7 +2108,15 @@ async def consume():
             for partition in partitions:
                 # Get committed offset (where we last left off)
                 committed = await consumer.committed(partition)
-                committed_offset = committed if committed is not None else -1
+                # Ensure committed_offset is always a valid integer
+                if committed is None:
+                    committed_offset = -1
+                elif isinstance(committed, (int, type(None))):
+                    committed_offset = committed if committed is not None else -1
+                else:
+                    # Handle unexpected type
+                    print(f"   ⚠️  Unexpected committed type: {type(committed)}, defaulting to -1")
+                    committed_offset = -1
                 
                 # Get latest offset (end of partition)
                 await consumer.seek_to_end(partition)
@@ -2131,12 +2134,13 @@ async def consume():
                     messages_available = latest_offset - committed_offset
                     print(f"      ⚠️  {messages_available} message(s) available between committed and latest!")
                     # Seek to committed position to process those messages
-                    if committed_offset is not None:
+                    # committed_offset is guaranteed to be >= 0 here, so it's safe to use
+                    try:
                         await consumer.seek(partition, committed_offset)
                         print(f"      ✅ Seeking to committed offset {committed_offset} to process available messages")
-                    else:
+                    except Exception as seek_error:
+                        print(f"      ⚠️  Error seeking to {committed_offset}: {seek_error}, positioning at latest")
                         await consumer.seek_to_end(partition)
-                        print(f"      ✅ No valid committed offset, positioned at latest")
                 elif committed_offset < 0 and latest_offset > beginning_offset:
                     # No committed offset, but there are messages - process from beginning to catch up
                     messages_available = latest_offset - beginning_offset
@@ -2163,12 +2167,24 @@ async def consume():
                 print(f"   ✅ Partitions assigned: {[p.partition for p in partitions]}")
                 for partition in partitions:
                     committed = await consumer.committed(partition)
-                    committed_offset = committed if committed is not None else -1
+                    # Ensure committed_offset is always a valid integer
+                    if committed is None:
+                        committed_offset = -1
+                    elif isinstance(committed, (int, type(None))):
+                        committed_offset = committed if committed is not None else -1
+                    else:
+                        committed_offset = -1
+                    
                     await consumer.seek_to_end(partition)
                     latest_offset = await consumer.position(partition)
                     if latest_offset > committed_offset and committed_offset >= 0:
-                        await consumer.seek(partition, committed_offset)
-                        print(f"   📍 Partition {partition.partition}: seeking to committed {committed_offset} (latest: {latest_offset})")
+                        try:
+                            await consumer.seek(partition, committed_offset)
+                            print(f"   📍 Partition {partition.partition}: seeking to committed {committed_offset} (latest: {latest_offset})")
+                        except Exception as seek_error:
+                            print(f"   ⚠️  Error seeking to {committed_offset}: {seek_error}, positioning at latest")
+                            await consumer.seek_to_end(partition)
+                            print(f"   📍 Partition {partition.partition}: positioned at latest {latest_offset}")
                     else:
                         await consumer.seek_to_end(partition)
                         print(f"   📍 Partition {partition.partition}: positioned at latest {latest_offset}")
