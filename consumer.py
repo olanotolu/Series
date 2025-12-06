@@ -37,6 +37,8 @@ from onboarding_flow import (
     validate_answer, get_completion_message, format_profile_summary,
     extract_value
 )
+from embedding_service import generate_user_embedding, store_embedding
+from user_matching import find_matches, get_match_profiles, format_match_message, calculate_common_hobbies
 
 # Session Manager (Supabase) - optional
 try:
@@ -984,8 +986,61 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                 session_manager.update_profile(sender, onboarding_complete=True, onboarding_state="complete")
             await loop.run_in_executor(CPU_BOUND_EXECUTOR, complete_onboarding)
             profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
-            completion_msg = get_completion_message(profile)
-            await send_text(session, chat_id, completion_msg)
+            
+            # Generate embedding and find match
+            print(f"   🧠 Generating personality embedding...")
+            embedding = await loop.run_in_executor(CPU_BOUND_EXECUTOR, generate_user_embedding, profile)
+            
+            if embedding:
+                # Store embedding
+                def store_embedding_wrapper():
+                    store_embedding(sender, embedding)
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_embedding_wrapper)
+                
+                # Find matches
+                print(f"   🔍 Finding matches...")
+                matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, find_matches, sender, 1)
+                
+                if matches:
+                    # Get enriched match data
+                    enriched_matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_match_profiles, matches)
+                    
+                    if enriched_matches:
+                        top_match = enriched_matches[0]
+                        match_score = top_match.get('score', 0.0)
+                        
+                        # Calculate common hobbies
+                        current_hobbies = profile.get('hobbies', '')
+                        matched_hobbies = top_match.get('hobbies', '')
+                        common = await loop.run_in_executor(
+                            CPU_BOUND_EXECUTOR,
+                            calculate_common_hobbies,
+                            current_hobbies,
+                            matched_hobbies
+                        )
+                        
+                        # Format match message
+                        match_msg = format_match_message(top_match, match_score, common)
+                        
+                        # Send completion + match message
+                        completion_msg = get_completion_message(profile)
+                        full_message = f"{completion_msg}\n\n{match_msg}"
+                        await send_text(session, chat_id, full_message)
+                        
+                        print(f"   ✅ Match found: {top_match.get('name')} (score: {match_score:.2%})")
+                    else:
+                        # No enriched matches, just send completion
+                        completion_msg = get_completion_message(profile)
+                        await send_text(session, chat_id, completion_msg)
+                else:
+                    # No matches found, just send completion
+                    completion_msg = get_completion_message(profile)
+                    await send_text(session, chat_id, completion_msg)
+            else:
+                # Embedding generation failed, just send completion
+                completion_msg = get_completion_message(profile)
+                await send_text(session, chat_id, completion_msg)
+            
             await stop_typing(session, chat_id)
             print(f"   ✅ Onboarding complete! Profile saved: {profile}")
             return

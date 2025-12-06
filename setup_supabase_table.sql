@@ -1,6 +1,9 @@
 -- Create sessions table for storing conversation history
 -- Run this in your Supabase SQL Editor
 
+-- Enable pgvector extension for vector similarity search
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS public.sessions (
     user_id TEXT PRIMARY KEY,
     history JSONB DEFAULT '[]'::jsonb,
@@ -53,4 +56,50 @@ CREATE TRIGGER update_sessions_updated_at
 
 -- Verify table was created
 SELECT 'Table created successfully!' AS status;
+
+-- Create user_embeddings table for AI-powered matching
+CREATE TABLE IF NOT EXISTS public.user_embeddings (
+    user_id TEXT PRIMARY KEY REFERENCES sessions(user_id) ON DELETE CASCADE,
+    vector vector(1536),  -- OpenAI text-embedding-3-large dimension
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS user_embeddings_vector_idx 
+ON user_embeddings USING ivfflat (vector vector_cosine_ops)
+WITH (lists = 100);
+
+-- Create matches table for tracking user matches
+CREATE TABLE IF NOT EXISTS public.matches (
+    id SERIAL PRIMARY KEY,
+    user1_id TEXT REFERENCES sessions(user_id) ON DELETE CASCADE,
+    user2_id TEXT REFERENCES sessions(user_id) ON DELETE CASCADE,
+    score FLOAT,
+    matched_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    status TEXT DEFAULT 'pending',  -- 'pending', 'accepted', 'declined'
+    UNIQUE(user1_id, user2_id)
+);
+
+CREATE INDEX IF NOT EXISTS matches_user1_idx ON matches(user1_id);
+CREATE INDEX IF NOT EXISTS matches_user2_idx ON matches(user2_id);
+CREATE INDEX IF NOT EXISTS matches_score_idx ON matches(score DESC);
+
+-- Enable RLS on new tables
+ALTER TABLE public.user_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.matches ENABLE ROW LEVEL SECURITY;
+
+-- Create policies for user_embeddings
+CREATE POLICY "Service role can manage embeddings"
+    ON public.user_embeddings
+    FOR ALL
+    USING (true)
+    WITH CHECK (true);
+
+-- Create policies for matches
+CREATE POLICY "Service role can manage matches"
+    ON public.matches
+    FOR ALL
+    USING (true)
+    WITH CHECK (true);
+
+SELECT 'Embedding and matching tables created successfully!' AS status;
 

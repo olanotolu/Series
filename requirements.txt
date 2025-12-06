@@ -8,3 +8,4 @@ aiohttp
 aiokafka
 boto3
 supabase
+openai

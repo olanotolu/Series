@@ -296,3 +296,24 @@ class SessionManager:
         except Exception as e:
             print(f"   ⚠️  Supabase is_onboarding_complete error: {e}")
             return False
+
+    def get_all_completed_profiles(self, exclude_user_id: str = None) -> List[Dict]:
+        """Get all users with completed onboarding profiles."""
+        if not self.supabase:
+            return []
+        
+        try:
+            query = self.supabase.table("sessions").select("user_id, name, school, age, hobbies, onboarding_complete")
+            query = query.eq("onboarding_complete", True)
+            
+            if exclude_user_id:
+                query = query.neq("user_id", exclude_user_id)
+            
+            response = query.execute()
+            
+            if response.data:
+                return response.data
+            return []
+        except Exception as e:
+            print(f"   ⚠️  Supabase get_all_completed_profiles error: {e}")
+            return []
