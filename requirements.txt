@@ -4,4 +4,7 @@ python-dotenv
 pydub
 huggingface_hub
 langdetect
-cartesia
+aiohttp
+aiokafka
+boto3
+supabase

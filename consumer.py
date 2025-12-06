@@ -17,8 +17,12 @@ import base64
 import shutil
 import random
 import traceback
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Load environment variables FIRST, before any other imports that need them
+load_dotenv()
 
 # Async libraries
 import aiohttp
@@ -28,10 +32,37 @@ from aiokafka.errors import KafkaError
 # Reuse existing utilities (will be run in executor if blocking)
 from opus_to_wav import opus_to_wav
 from dlq_handler import send_to_dlq, classify_error, is_recoverable_error
-from session_manager import SessionManager
 
-# Initialize Session Manager
-session_manager = SessionManager()
+# Session Manager (Supabase) - optional
+try:
+    from session_manager_supabase import SessionManager as SessionManagerClass
+    session_manager = SessionManagerClass()
+    SESSION_MANAGER_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Supabase session manager not available: {e}")
+    print("   Continuing without session history (conversation context will be limited)")
+    SESSION_MANAGER_AVAILABLE = False
+    # Create a dummy session manager
+    class DummySessionManager:
+        def get_history(self, sender): return []
+        def add_message(self, sender, role, content): pass
+        def clear_history(self, sender): pass
+        def analyze_behavior(self, sender): return ""
+    session_manager = DummySessionManager()
+
+# AWS S3 Storage
+try:
+    from aws_audio_storage import (
+        upload_to_s3, download_from_s3, download_from_s3_bytes,
+        generate_s3_key, check_s3_bucket_exists
+    )
+    AWS_S3_AVAILABLE = True
+except ImportError as e:
+    AWS_S3_AVAILABLE = False
+    print(f"⚠️  AWS S3 integration error: {e}")
+
+# Initialize Session Manager (Supabase)
+session_manager = SessionManagerClass()
 
 # Hugging Face Async Client
 try:
@@ -41,8 +72,7 @@ except ImportError:
     HF_AVAILABLE = False
     print("⚠️  huggingface_hub not installed. Install with: pip install huggingface_hub")
 
-# Load environment variables
-load_dotenv()
+# Environment variables already loaded above
 
 # Series API credentials
 API_KEY = os.getenv('API_KEY')
@@ -60,6 +90,10 @@ KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD')
 # Hugging Face Token
 HF_TOKEN = os.getenv('HF_TOKEN', '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')
 
+# AWS S3 Configuration
+USE_S3_STORAGE = os.getenv('USE_S3_STORAGE', 'true').lower() == 'true'
+S3_AUDIO_BUCKET = os.getenv('S3_AUDIO_BUCKET', 'series-audio-files')
+
 # Language Detection
 try:
     from langdetect import detect, LangDetectException
@@ -68,13 +102,13 @@ except ImportError:
     LANGDETECT_AVAILABLE = False
     print("⚠️  langdetect not installed. Install with: pip install langdetect")
 
-# Cartesia TTS
+# ElevenLabs TTS
 try:
-    from cartesia_tts import generate_speech as cartesia_generate_speech
-    CARTESIA_AVAILABLE = True
+    from elevenlabs_tts import generate_speech as elevenlabs_generate_speech
+    ELEVENLABS_AVAILABLE = True
 except ImportError as e:
-    print(f"⚠️  Cartesia integration error: {e}")
-    CARTESIA_AVAILABLE = False
+    print(f"⚠️  ElevenLabs integration error: {e}")
+    ELEVENLABS_AVAILABLE = False
 
 # Global objects
 headers = {"Authorization": f"Bearer {API_KEY}"}
@@ -163,7 +197,7 @@ async def transcribe_audio(filename: str, language: str = None) -> tuple:
         return None, None
 
 
-async def get_llm_response(text: str, history: list = None, language: str = "en") -> str:
+async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "") -> str:
     """Get response from LLM using Hugging Face Inference API.
     Responds in the detected language (English, Hindi, or French)."""
     global hf_client
@@ -177,18 +211,29 @@ async def get_llm_response(text: str, history: list = None, language: str = "en"
         
         # Multilingual system prompt - responds in the same language as the user
         lang_instructions = {
-            "en": "Respond in English. Be warm, engaging, and natural.",
-            "hi": "Respond in Hindi (Devanagari script). Be warm, engaging, and natural. Use Hindi naturally and conversationally.",
-            "fr": "Respond in French. Be warm, engaging, and natural. Use French naturally and conversationally."
+            "en": "You MUST respond ONLY in English. Do not use French, Hindi, or any other language. Use English words and phrases only.",
+            "hi": "You MUST respond ONLY in Hindi (Devanagari script). Do not use English, French, or any other language. Use Hindi words and phrases only.",
+            "fr": "You MUST respond ONLY in French. Do not use English, Hindi, or any other language. Use French words and phrases only."
         }
         
         lang_instruction = lang_instructions.get(language, lang_instructions["en"])
+        lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
+        lang_name = lang_names.get(language, "English")
         
         system_prompt = f"""You are a friendly, helpful friend chatting on Series.so, a social network platform. 
-You're having a casual conversation with someone you know. {lang_instruction}
+You're having a casual conversation with someone you know.
+
+CRITICAL LANGUAGE RULE: The user is speaking in {lang_name}. {lang_instruction}
+You MUST match their language exactly. If they say "Hi" in English, you respond in English. If they say "Bonjour" in French, you respond in French. If they say "नमस्ते" in Hindi, you respond in Hindi.
+
+CONTEXT ABOUT USER STATE ({behavior_context}):
+Use this context to adjust your tone. 
+- If they are returning after a long silence, welcome them back warmly.
+- If they are messaging rapidly (high urgency), be concise and responsive.
+- If it's a normal flow, be relaxed.
+
 Keep responses concise (1-3 sentences typically), use casual language, and show genuine interest in the conversation.
-You can use emojis occasionally to add personality, but don't overdo it. Be yourself - friendly, supportive, and authentic.
-IMPORTANT: Always respond in the same language the user is using. If they write in Hindi, respond in Hindi. If they write in French, respond in French."""
+You can use emojis occasionally to add personality, but don't overdo it. Be yourself - friendly, supportive, and authentic."""
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -196,8 +241,10 @@ IMPORTANT: Always respond in the same language the user is using. If they write 
         if history:
             messages.extend(history)
             
-        # Add current message
-        messages.append({"role": "user", "content": text})
+        # Add current message with language context
+        # Format: "[Language: English] User message" to reinforce language matching
+        user_message = f"[Language: {lang_name}] {text}"
+        messages.append({"role": "user", "content": user_message})
         
         # Use Meta-Llama-3.2-3B-Instruct (reliable and fast via API, supports multilingual)
         response = await hf_client.chat_completion(
@@ -216,6 +263,18 @@ IMPORTANT: Always respond in the same language the user is using. If they write 
             }
             return fallbacks.get(language, fallbacks["en"])
         
+        # Validate language match - if LLM responded in wrong language, use fallback
+        detected_reply_lang = await detect_language(reply)
+        if detected_reply_lang != language and language != "en":
+            # If expected non-English but got different language, use fallback
+            print(f"   ⚠️  Language mismatch: Expected {language}, got {detected_reply_lang}. Using fallback.")
+            fallbacks = {
+                "en": f"Hey! {text} - that's interesting! What's on your mind?",
+                "hi": f"हाँ, {text} - यह दिलचस्प है! आप क्या सोच रहे हैं?",
+                "fr": f"Salut! {text} - c'est intéressant! Qu'est-ce qui te passe par la tête?"
+            }
+            return fallbacks.get(language, reply)
+        
         return reply
         
     except Exception as e:
@@ -225,29 +284,62 @@ IMPORTANT: Always respond in the same language the user is using. If they write 
 
 
 async def text_to_speech(text: str, language: str = "en", output_file: str = None) -> str:
-    """Convert text to speech using Cartesia API."""
+    """Convert text to speech using ElevenLabs API. Stores in S3 if enabled."""
     
-    if not CARTESIA_AVAILABLE:
-        print("   ❌ Cartesia TTS not available")
+    if not ELEVENLABS_AVAILABLE:
+        print("   ❌ ElevenLabs TTS not available")
         return None
     
     try:
         lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
-        print(f"   🔊 Generating Speech (Cartesia): {text[:50]}...")
+        lang_name = lang_names.get(language, language.upper())
+        print(f"   🔊 Generating Speech (ElevenLabs, {lang_name}): {text[:50]}...")
         
-        # Save audio to file
+        # Determine storage method
+        use_s3 = USE_S3_STORAGE and AWS_S3_AVAILABLE
+        
+        # Generate output path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         if output_file is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_file = f"audio_files/tts_response_{timestamp}.wav"
+            if use_s3:
+                # For S3, we'll use a temp file first, then upload
+                output_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
+            else:
+                os.makedirs("audio_files", exist_ok=True)
+                output_file = f"audio_files/tts_response_{timestamp}.wav"
         
-        os.makedirs("audio_files", exist_ok=True)
-        
-        # Call Cartesia with language parameter for multilingual support
-        result_file = await cartesia_generate_speech(text, output_file, language=language)
+        # Call ElevenLabs with language parameter for multilingual support
+        result_file = await elevenlabs_generate_speech(text, output_file, language=language)
         
         if result_file and os.path.exists(result_file):
-            print(f"   ✅ TTS audio saved: {result_file}")
-            return result_file
+            if use_s3:
+                # Upload to S3
+                loop = asyncio.get_event_loop()
+                
+                def upload_tts_to_s3():
+                    with open(result_file, 'rb') as f:
+                        wav_data = f.read()
+                    
+                    s3_key = f"tts_response_{timestamp}.wav"
+                    upload_success = upload_to_s3(S3_AUDIO_BUCKET, s3_key, wav_data, 'audio/wav')
+                    
+                    # Cleanup local temp file
+                    os.unlink(result_file)
+                    
+                    if upload_success:
+                        return f"s3://{S3_AUDIO_BUCKET}/{s3_key}"
+                    return None
+                
+                s3_path = await loop.run_in_executor(CPU_BOUND_EXECUTOR, upload_tts_to_s3)
+                if s3_path:
+                    print(f"   ✅ TTS audio uploaded to S3: {s3_path}")
+                    return s3_path
+                else:
+                    print(f"   ⚠️  S3 upload failed, using local file")
+                    return result_file
+            else:
+                print(f"   ✅ TTS audio saved locally: {result_file}")
+                return result_file
         else:
             print(f"   ❌ TTS failed (no file created)")
             return None
@@ -314,21 +406,33 @@ async def send_text(session: aiohttp.ClientSession, chat_id: str, text: str):
 
 async def send_audio(session: aiohttp.ClientSession, chat_id: str, audio_file_path: str, text: str = "🎤 Voice message"):
     """Send an audio message (voice memo) via Series API.
-    The text parameter is required by the API and will be displayed alongside the audio."""
+    The text parameter is required by the API and will be displayed alongside the audio.
+    Supports both local file paths and S3 paths (s3://bucket/key)."""
     url = f"{BASE_URL}/api/chats/{chat_id}/chat_messages"
     
     # Read audio file and encode to base64 (run in executor)
     loop = asyncio.get_event_loop()
     
     def read_and_encode():
-        with open(audio_file_path, 'rb') as f:
-            audio_data = f.read()
+        # Handle S3 path
+        if audio_file_path.startswith('s3://'):
+            bucket, key = audio_file_path.replace('s3://', '').split('/', 1)
+            audio_data = download_from_s3_bytes(bucket, key)
+            if not audio_data:
+                raise Exception(f"Failed to download audio from S3: {audio_file_path}")
+        else:
+            # Local file
+            with open(audio_file_path, 'rb') as f:
+                audio_data = f.read()
         return base64.b64encode(audio_data).decode('ascii')
     
     audio_base64 = await loop.run_in_executor(CPU_BOUND_EXECUTOR, read_and_encode)
     
     # Determine format - M4A is the target for voice memos
-    filename = os.path.basename(audio_file_path)
+    if audio_file_path.startswith('s3://'):
+        filename = audio_file_path.split('/')[-1]
+    else:
+        filename = os.path.basename(audio_file_path)
     if audio_file_path.endswith('.m4a'):
         mime_type = 'audio/m4a'
     elif audio_file_path.endswith('.opus'):
@@ -416,13 +520,30 @@ async def download_file(session: aiohttp.ClientSession, url: str) -> bytes:
 
 
 def wav_to_m4a(wav_file: str, m4a_file: str = None) -> str:
-    """Convert WAV file to M4A (AAC) format using ffmpeg."""
-    if m4a_file is None:
-        m4a_file = wav_file.replace('.wav', '.m4a')
+    """Convert WAV file to M4A (AAC) format using ffmpeg. Supports S3 paths."""
+    use_s3 = USE_S3_STORAGE and AWS_S3_AVAILABLE and wav_file.startswith('s3://')
     
     try:
         import subprocess
-        # ffmpeg -y -i input.wav -c:a aac -b:a 48k output.m4a
+        
+        # Handle S3 input
+        if use_s3:
+            # Download from S3 to temp file
+            bucket, key = wav_file.replace('s3://', '').split('/', 1)
+            temp_wav = download_from_s3(bucket, key)
+            if not temp_wav:
+                return None
+            wav_file = temp_wav
+        
+        # Generate output path
+        if m4a_file is None:
+            if use_s3:
+                # Use temp file, will upload to S3
+                m4a_file = tempfile.NamedTemporaryFile(suffix='.m4a', delete=False).name
+            else:
+                m4a_file = wav_file.replace('.wav', '.m4a')
+        
+        # Convert using ffmpeg
         result = subprocess.run([
             'ffmpeg', '-y', 
             '-i', wav_file,
@@ -432,8 +553,35 @@ def wav_to_m4a(wav_file: str, m4a_file: str = None) -> str:
         ], check=True, capture_output=True)
         
         if os.path.exists(m4a_file):
-            print(f"   ✅ Converted WAV → M4A: {m4a_file}")
-            return m4a_file
+            if use_s3:
+                # Upload to S3
+                with open(m4a_file, 'rb') as f:
+                    m4a_data = f.read()
+                
+                # Generate S3 key from original WAV key
+                bucket, wav_key = wav_file.replace('s3://', '').split('/', 1) if wav_file.startswith('s3://') else (S3_AUDIO_BUCKET, '')
+                m4a_key = wav_key.replace('.wav', '.m4a') if wav_key else f"tts_response_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.m4a"
+                
+                upload_success = upload_to_s3(bucket, m4a_key, m4a_data, 'audio/m4a')
+                
+                # Cleanup temp files
+                os.unlink(m4a_file)
+                if wav_file != temp_wav:
+                    try:
+                        os.unlink(temp_wav)
+                    except:
+                        pass
+                
+                if upload_success:
+                    s3_path = f"s3://{bucket}/{m4a_key}"
+                    print(f"   ✅ Converted WAV → M4A and uploaded to S3: {s3_path}")
+                    return s3_path
+                else:
+                    print(f"   ⚠️  S3 upload failed")
+                    return None
+            else:
+                print(f"   ✅ Converted WAV → M4A: {m4a_file}")
+                return m4a_file
         else:
             print(f"   ⚠️  M4A file not created")
             return None
@@ -473,61 +621,160 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
         return
 
     try:
-        audio_dir = "audio_files"
-        os.makedirs(audio_dir, exist_ok=True)
-        
-        # STEP 1: Save OPUS file
-        print(f"   💾 STEP 1: Saving OPUS file...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_sender = sender.replace("+", "").replace("-", "")
-        opus_filename = f"{audio_dir}/voice_memo_{safe_sender}_{timestamp}_{message_id}.opus"
+        
+        # Determine storage method (S3 or local)
+        use_s3 = USE_S3_STORAGE and AWS_S3_AVAILABLE
+        
+        if use_s3:
+            # Verify S3 bucket exists
+            loop = asyncio.get_event_loop()
+            bucket_exists = await loop.run_in_executor(
+                CPU_BOUND_EXECUTOR, 
+                check_s3_bucket_exists, 
+                S3_AUDIO_BUCKET
+            )
+            if not bucket_exists:
+                print(f"   ⚠️  S3 bucket '{S3_AUDIO_BUCKET}' not accessible, falling back to local storage")
+                use_s3 = False
         
         loop = asyncio.get_event_loop()
         
-        def save_and_convert():
+        if use_s3:
+            # STEP 1: Upload OPUS to S3
+            print(f"   💾 STEP 1: Uploading OPUS to S3...")
             opus_bytes = base64.b64decode(base64_opus)
-            with open(opus_filename, 'wb') as f:
-                f.write(opus_bytes)
-            print(f"   ✅ STEP 1 COMPLETE: OPUS saved ({len(opus_bytes)} bytes)")
-            return opus_to_wav(base64_opus)
-
-        # STEP 2-4: Convert OPUS → WAV
-        print(f"   🎵 STEP 2-4: Converting OPUS → WAV...")
-        wav_file = await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_and_convert)
+            opus_s3_key = generate_s3_key("voice_memo", sender, timestamp, message_id, "opus")
+            
+            upload_success = await loop.run_in_executor(
+                CPU_BOUND_EXECUTOR,
+                upload_to_s3,
+                S3_AUDIO_BUCKET,
+                opus_s3_key,
+                opus_bytes,
+                'audio/ogg'
+            )
+            
+            if upload_success:
+                print(f"   ✅ STEP 1 COMPLETE: OPUS uploaded to S3 ({len(opus_bytes)} bytes)")
+            else:
+                print(f"   ⚠️  S3 upload failed, falling back to local")
+                use_s3 = False
         
-        # Save a copy with nice name
-        wav_filename = f"{audio_dir}/voice_memo_{safe_sender}_{timestamp}_{message_id}.wav"
-        if os.path.exists(wav_file):
-            shutil.copy2(wav_file, wav_filename)
-            print(f"   ✅ STEP 2-4 COMPLETE: WAV saved: {wav_filename}")
+        if not use_s3:
+            # Fallback to local storage
+            audio_dir = "audio_files"
+            os.makedirs(audio_dir, exist_ok=True)
+            opus_filename = f"{audio_dir}/voice_memo_{safe_sender}_{timestamp}_{message_id}.opus"
+            
+            def save_local():
+                opus_bytes = base64.b64decode(base64_opus)
+                with open(opus_filename, 'wb') as f:
+                    f.write(opus_bytes)
+                print(f"   ✅ STEP 1 COMPLETE: OPUS saved locally ({len(opus_bytes)} bytes)")
+                return opus_to_wav(base64_opus)
+            
+            wav_file = await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_local)
+            wav_filename = f"{audio_dir}/voice_memo_{safe_sender}_{timestamp}_{message_id}.wav"
+            if os.path.exists(wav_file):
+                shutil.copy2(wav_file, wav_filename)
+                print(f"   ✅ STEP 2-4 COMPLETE: WAV saved locally: {wav_filename}")
+        else:
+            # STEP 2-4: Convert OPUS → WAV (using local temp file, then upload to S3)
+            print(f"   🎵 STEP 2-4: Converting OPUS → WAV...")
+            
+            def convert_and_upload():
+                # Convert using local temp file
+                wav_temp = opus_to_wav(base64_opus)
+                if not wav_temp or not os.path.exists(wav_temp):
+                    return None
+                
+                # Read WAV data
+                with open(wav_temp, 'rb') as f:
+                    wav_data = f.read()
+                
+                # Upload to S3
+                wav_s3_key = generate_s3_key("voice_memo", sender, timestamp, message_id, "wav")
+                upload_success = upload_to_s3(S3_AUDIO_BUCKET, wav_s3_key, wav_data, 'audio/wav')
+                
+                # Cleanup temp file
+                os.unlink(wav_temp)
+                
+                if upload_success:
+                    return wav_s3_key
+                return None
+            
+            wav_s3_key = await loop.run_in_executor(CPU_BOUND_EXECUTOR, convert_and_upload)
+            
+            if wav_s3_key:
+                print(f"   ✅ STEP 2-4 COMPLETE: WAV uploaded to S3: {wav_s3_key}")
+                # Download to temp file for Whisper (needs local file)
+                wav_filename = await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    download_from_s3,
+                    S3_AUDIO_BUCKET,
+                    wav_s3_key
+                )
+            else:
+                print(f"   ⚠️  WAV conversion/upload failed")
+                wav_filename = None
         
         # Transcribe (with language detection)
+        if not wav_filename:
+            print("   ⚠️  No WAV file available for transcription")
+            await send_text(session, chat_id, "Sorry, couldn't process that voice memo.")
+            return
+        
         print(f"   🎤 STEP 5: Transcribing WAV → Text (Whisper)...")
         transcript, detected_language = await transcribe_audio(wav_filename)
+        
+        # Cleanup temp WAV file if it was downloaded from S3
+        if use_s3 and wav_filename and os.path.exists(wav_filename) and '/tmp' in wav_filename:
+            try:
+                os.unlink(wav_filename)
+            except:
+                pass
         
         if transcript:
             lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
             lang_name = lang_names.get(detected_language, "Unknown")
-            print(f"   ✅ STEP 5 COMPLETE: Transcript ({lang_name}): {transcript}")
+            print(f"   ✅ STEP 5 COMPLETE: Transcript ({lang_names.get(detected_language, 'Unknown')}): {transcript}")
             
             # Start typing
             await start_typing(session, chat_id)
             
-            # Get user history (run in executor)
+            # Get user history and behavioral context
             loop = asyncio.get_event_loop()
             history = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_history, sender)
+            behavior_context = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.analyze_behavior, sender)
+            
+            print(f"   🧠 Behavioral Context: {behavior_context}")
             
             try:
+                if not transcript:
+                    transcript = "(Audio)"
+                
+                # Detect language of transcript for multilingual routing
+                if transcript and transcript != "(Audio)":
+                    detected_language = await detect_language(transcript)
+                else:
+                    detected_language = "en"  # Default to English if no transcript
+                    
+                lang_name = {"en": "English", "hi": "Hindi", "fr": "French"}.get(detected_language, "English")
+                    
+                # Get LLM response (Text) with behavior context
                 print(f"   🤖 STEP 6: Getting LLM response from transcript ({lang_name})...")
-                llm_reply = await get_llm_response(transcript, history, language=detected_language or "en")
+                llm_reply = await get_llm_response(transcript, history, language=detected_language or "en", behavior_context=behavior_context)
                 print(f"   ✅ STEP 6 COMPLETE: LLM Response ({lang_name}): {llm_reply[:100]}...")
                 
-                # SEND VOICE RESPONSE: Convert LLM text to speech, then send as audio
+                # SEND VOICE RESPONSE: Voice memo in → Voice memo out
+                # Convert LLM text to speech, then send as audio
                 print(f"   🔊 STEP 7: Converting LLM text → Speech (TTS, {lang_name})...")
                 tts_wav = await text_to_speech(llm_reply, language=detected_language or "en")
                 
-                if tts_wav and os.path.exists(tts_wav):
-                    print(f"   ✅ STEP 7 COMPLETE: TTS WAV saved: {tts_wav}")
+                if tts_wav and (os.path.exists(tts_wav) or tts_wav.startswith('s3://')):
+                    print(f"   ✅ STEP 7 COMPLETE: TTS WAV ready: {tts_wav}")
                     
                     # Convert WAV to M4A (AAC) for iMessage voice memo
                     print(f"   🎵 STEP 8: Converting TTS WAV → M4A (AAC)...")
@@ -538,20 +785,26 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
                         tts_wav
                     )
                     
-                    if m4a_file and os.path.exists(m4a_file):
+                    if m4a_file and (os.path.exists(m4a_file) or m4a_file.startswith('s3://')):
                         print(f"   ✅ STEP 8 COMPLETE: M4A file ready: {m4a_file}")
                         # Send voice response (with text transcript for API requirement)
-                        print(f"   📤 STEP 9: Sending voice response to phone...")
+                        print(f"   📤 STEP 9: Sending VOICE response (voice memo in → voice memo out)...")
                         await send_audio(session, chat_id, m4a_file, text=llm_reply)
                         print(f"   ✅ STEP 9 COMPLETE: Voice response sent!")
                     else:
-                        # Fallback to text if M4A conversion fails
-                        print(f"   ⚠️  M4A conversion failed, sending text instead")
-                        await send_text(session, chat_id, llm_reply)
+                        # Retry: Try sending WAV directly if M4A conversion fails
+                        print(f"   ⚠️  M4A conversion failed, trying to send WAV directly...")
+                        try:
+                            await send_audio(session, chat_id, tts_wav, text=llm_reply)
+                            print(f"   ✅ Voice response sent as WAV!")
+                        except:
+                            # Last resort: Send text only if audio completely fails
+                            print(f"   ❌ Audio send failed, sending text as last resort")
+                            await send_text(session, chat_id, f"🎤 {llm_reply}")
                 else:
-                    # Fallback to text if TTS fails
-                    print(f"   ⚠️  TTS failed, sending text instead")
-                    await send_text(session, chat_id, llm_reply)
+                    # Last resort: Send text only if TTS completely fails
+                    print(f"   ❌ TTS failed completely, sending text as last resort")
+                    await send_text(session, chat_id, f"🎤 {llm_reply}")
                 
                 # Save context (run in executor)
                 def save_context():
@@ -561,15 +814,34 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
                 
             except Exception as e:
                 print(f"   ⚠️  LLM error: {e}")
-                await send_text(session, chat_id, f"🎤 I heard: {transcript}")
+                # Even on error, try to send voice response if possible
+                # Fallback to text only if voice completely fails
+                try:
+                    error_tts = await text_to_speech(f"I heard: {transcript}", language=detected_language or "en")
+                    if error_tts:
+                        m4a_file = await loop.run_in_executor(CPU_BOUND_EXECUTOR, wav_to_m4a, error_tts)
+                        if m4a_file:
+                            await send_audio(session, chat_id, m4a_file, text=f"🎤 I heard: {transcript}")
+                        else:
+                            await send_text(session, chat_id, f"🎤 I heard: {transcript}")
+                    else:
+                        await send_text(session, chat_id, f"🎤 I heard: {transcript}")
+                except:
+                    await send_text(session, chat_id, f"🎤 I heard: {transcript}")
             
             await stop_typing(session, chat_id)
         else:
-            await send_text(session, chat_id, f"🎤 Got your voice memo! Saved as {os.path.basename(opus_filename)}")
+            if use_s3:
+                await send_text(session, chat_id, f"🎤 Got your voice memo! Saved to S3")
+            else:
+                await send_text(session, chat_id, f"🎤 Got your voice memo! Saved locally")
         
-        # Cleanup temp file
-        if os.path.exists(wav_file) and wav_file != wav_filename:
-            os.unlink(wav_file)
+        # Cleanup temp files (if local and not the final wav_filename)
+        if not use_s3 and 'wav_file' in locals() and os.path.exists(wav_file) and wav_file != wav_filename:
+            try:
+                os.unlink(wav_file)
+            except:
+                pass
 
     except Exception as e:
         print(f"   ❌ Error processing audio: {e}")
@@ -578,12 +850,26 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
 
 
 async def process_text_message(session: aiohttp.ClientSession, event_data: dict):
-    """Process incoming text message with multilingual support."""
+    """Process incoming text message with multilingual support.
+    Text in → Text out (always sends text, never audio)."""
     chat_id = event_data.get("chat_id")
     text = event_data.get("text", "")
     sender = event_data.get("from_phone", "")
     
-    print(f"\n📥 INCOMING MESSAGE from {sender}: {text}")
+    print(f"\n📥 INCOMING TEXT MESSAGE from {sender}: {text}")
+
+    # HARD RESET COMMAND
+    if text.strip().lower() == "/reset":
+        print(f"   🔄 Executing HARD RESET for {sender}...")
+        
+        # Run in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_history, sender)
+        
+        welcome_msg = "🔄 Memory wiped. Let's start over! \n\nI'm your AI companion. Tell me a bit about yourself—what's your name and what do you like to do?"
+        await send_text(session, chat_id, welcome_msg)
+        print("   ✅ Reset complete and welcome message sent.")
+        return
     
     # Detect language
     detected_language = await detect_language(text)
@@ -594,11 +880,15 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     await start_typing(session, chat_id)
     
     # Get user history (run in executor)
+    # Get user history and behavioral context
     loop = asyncio.get_event_loop()
     history = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_history, sender)
+    behavior_context = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.analyze_behavior, sender)
+    
+    print(f"   🧠 Behavioral Context: {behavior_context}")
     
     try:
-        reply = await get_llm_response(text, history, language=detected_language)
+        reply = await get_llm_response(text, history, language=detected_language or "en", behavior_context=behavior_context)
         print(f"   💬 LLM Response ({lang_name}): {reply[:100]}...")
         
         # Save context (run in executor)
@@ -616,6 +906,8 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
         }
         reply = fallbacks.get(detected_language, fallbacks["en"])
     
+    # TEXT IN → TEXT OUT: Always send text response for text messages
+    print(f"   📤 Sending TEXT response (text in → text out)...")
     await send_text(session, chat_id, reply)
     await stop_typing(session, chat_id)
 
@@ -650,21 +942,94 @@ async def consume():
     await consumer.start()
     print("✅ Kafka Consumer started!")
     
-    # Seek to end of all partitions to only process NEW messages
-    print("⏩ Seeking to end of all partitions (ONLY NEW MESSAGES)...")
+    # Verify topic access
+    try:
+        topics = await consumer.list_topics()
+        if TOPIC_NAME in topics:
+            print(f"✅ Topic '{TOPIC_NAME}' found")
+            partitions = topics[TOPIC_NAME]
+            print(f"   📊 Topic has {len(partitions)} partition(s)")
+        else:
+            print(f"⚠️  Topic '{TOPIC_NAME}' not found in available topics")
+            print(f"   Available topics: {list(topics.keys())[:10]}")
+    except Exception as e:
+        print(f"⚠️  Could not list topics: {e}")
+    
+    # Wait for partition assignment (can take a moment)
+    print("⏳ Waiting for partition assignment...")
+    await asyncio.sleep(2)  # Give Kafka time to assign partitions
+    
+    # Get partition information and check for messages
+    print("⏩ Checking partition offsets...")
     try:
         partitions = consumer.assignment()
+        print(f"   📊 Assigned partitions: {[p.partition for p in partitions] if partitions else 'None'}")
         if partitions:
+            # Check committed offsets vs latest offsets
             for partition in partitions:
+                # Get committed offset (where we last left off)
+                committed = await consumer.committed(partition)
+                committed_offset = committed if committed is not None else -1
+                
+                # Get latest offset (end of partition)
                 await consumer.seek_to_end(partition)
-                end_offset = await consumer.position(partition)
-                print(f"   📍 Partition {partition.partition}: positioned at offset {end_offset} (end)")
-            await consumer.commit()
-            print("   ✅ Committed end position - will only process NEW messages")
+                latest_offset = await consumer.position(partition)
+                
+                # Get beginning offset (start of partition)
+                await consumer.seek_to_beginning(partition)
+                beginning_offset = await consumer.position(partition)
+                
+                print(f"   📍 Partition {partition.partition}:")
+                print(f"      Beginning: {beginning_offset}, Committed: {committed_offset}, Latest: {latest_offset}")
+                
+                # If there are messages between committed and latest, we should process them
+                if latest_offset > committed_offset and committed_offset >= 0:
+                    messages_available = latest_offset - committed_offset
+                    print(f"      ⚠️  {messages_available} message(s) available between committed and latest!")
+                    # Seek to committed position to process those messages
+                    await consumer.seek(partition, committed_offset)
+                    print(f"      ✅ Seeking to committed offset {committed_offset} to process available messages")
+                elif committed_offset < 0 and latest_offset > beginning_offset:
+                    # No committed offset, but there are messages - process from beginning to catch up
+                    messages_available = latest_offset - beginning_offset
+                    print(f"      ⚠️  No committed offset, but {messages_available} message(s) available!")
+                    # Process from beginning to catch up on missed messages
+                    await consumer.seek(partition, beginning_offset)
+                    print(f"      ✅ Seeking to beginning ({beginning_offset}) to process available messages")
+                elif latest_offset > beginning_offset:
+                    # No committed offset, but there are messages - process from latest to only get NEW messages
+                    await consumer.seek_to_end(partition)
+                    print(f"      ✅ No committed offset, positioned at latest ({latest_offset}) for NEW messages only")
+                else:
+                    # No messages available
+                    await consumer.seek_to_end(partition)
+                    print(f"      ✅ No messages, positioned at end ({latest_offset})")
+            
+            # Don't commit yet - let messages be processed first
+            print("   ✅ Positioned for message consumption")
         else:
-            print("   ⚠️  No partitions assigned yet")
+            print("   ⚠️  No partitions assigned yet - waiting...")
+            await asyncio.sleep(3)
+            partitions = consumer.assignment()
+            if partitions:
+                print(f"   ✅ Partitions assigned: {[p.partition for p in partitions]}")
+                for partition in partitions:
+                    committed = await consumer.committed(partition)
+                    committed_offset = committed if committed is not None else -1
+                    await consumer.seek_to_end(partition)
+                    latest_offset = await consumer.position(partition)
+                    if latest_offset > committed_offset and committed_offset >= 0:
+                        await consumer.seek(partition, committed_offset)
+                        print(f"   📍 Partition {partition.partition}: seeking to committed {committed_offset} (latest: {latest_offset})")
+                    else:
+                        await consumer.seek_to_end(partition)
+                        print(f"   📍 Partition {partition.partition}: positioned at latest {latest_offset}")
+            else:
+                print("   ❌ Still no partitions assigned - check Kafka connection")
     except Exception as e:
-        print(f"   ⚠️  Error seeking to end: {e}")
+        print(f"   ⚠️  Error checking offsets: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("🔄 Waiting for messages...")
 
@@ -678,116 +1043,196 @@ async def consume():
             # Use getmany with timeout to allow heartbeat checks
             while True:
                 # Poll for messages with timeout
-                msg_pack = await consumer.getmany(timeout_ms=1000, max_records=10)
+                try:
+                    msg_pack = await consumer.getmany(timeout_ms=1000, max_records=10)
+                except Exception as e:
+                    print(f"   ⚠️  Error polling messages: {e}")
+                    await asyncio.sleep(1)
+                    continue
                 
                 if not msg_pack:
-                    # No messages - check heartbeat
+                    # No messages - check heartbeat and verify we're not stuck
                     current_time = time.time()
                     if current_time - last_heartbeat > 30:
-                        print(f"💓 Consumer heartbeat - waiting for messages... (processed {message_count} so far)")
+                        # Check partition positions and offsets for debugging
+                        try:
+                            partitions = consumer.assignment()
+                            if partitions:
+                                pos_info = []
+                                offset_info = []
+                                for p in partitions:
+                                    try:
+                                        pos = await consumer.position(p)
+                                        # Get latest offset
+                                        await consumer.seek_to_end(p)
+                                        latest = await consumer.position(p)
+                                        # Restore position
+                                        await consumer.seek(p, pos)
+                                        
+                                        pos_info.append(f"P{p.partition}:{pos}")
+                                        if latest > pos:
+                                            offset_info.append(f"P{p.partition}: {latest-pos} msgs ahead")
+                                    except Exception as e:
+                                        pos_info.append(f"P{p.partition}:?")
+                                
+                                status = f"Positions: {', '.join(pos_info)}"
+                                if offset_info:
+                                    status += f" | ⚠️  {', '.join(offset_info)}"
+                                print(f"💓 Consumer heartbeat - waiting for messages... (processed {message_count} so far) | {status}")
+                            else:
+                                print(f"💓 Consumer heartbeat - waiting for messages... (processed {message_count} so far) | No partitions assigned!")
+                        except Exception as e:
+                            print(f"💓 Consumer heartbeat - waiting for messages... (processed {message_count} so far) | Error checking positions: {e}")
                         last_heartbeat = current_time
                     continue
                 
                 # Process all messages in the batch
+                # Sort messages by partition and offset to ensure order within each partition
+                sorted_messages = []
                 for topic_partition, messages in msg_pack.items():
                     for msg in messages:
-                        message_count += 1
-                        try:
-                            event = json.loads(msg.value.decode('utf-8'))
-                            
-                            # Log basics
-                            event_type = event.get("event_type")
-                            event_id = event.get("event_id") or "N/A"
-                            print(f"\n{'='*60}")
-                            print(f"📨 EVENT #{message_count}: {event_type} | ID: {event_id} | Offset: {msg.offset} | Partition: {msg.partition}")
-                            print(f"{'='*60}")
+                        sorted_messages.append((topic_partition, msg))
+                
+                # Sort by partition first, then by offset within partition
+                sorted_messages.sort(key=lambda x: (x[0].partition, x[1].offset))
+                
+                for topic_partition, msg in sorted_messages:
+                    message_count += 1
+                    try:
+                        event = json.loads(msg.value.decode('utf-8'))
+                        
+                        # Log basics
+                        event_type = event.get("event_type")
+                        event_id = event.get("event_id") or "N/A"
+                        print(f"\n{'='*60}")
+                        print(f"📨 EVENT #{message_count}: {event_type} | ID: {event_id} | Offset: {msg.offset} | Partition: {msg.partition}")
+                        print(f"{'='*60}")
 
-                            # FILTER: Check for malformed error events (feedback loop prevention)
-                            if not event_type:
-                                if "llm_response" in event or "error" in event:
-                                    print("⚠️  IGNORING malformed event (feedback loop)")
-                                    await consumer.commit()
-                                    continue
-                                # If truly unknown, log and continue
-                                print("⚠️  Missing event_type, skipping.")
+                        # FILTER: Check for malformed error events (feedback loop prevention)
+                        if not event_type:
+                            if "llm_response" in event or "error" in event:
+                                print("⚠️  IGNORING malformed event (feedback loop)")
                                 await consumer.commit()
                                 continue
+                            # If truly unknown, log and continue
+                            print("⚠️  Missing event_type, skipping.")
+                            await consumer.commit()
+                            continue
 
-                            # Extract data
-                            data = event.get("data", {})
+                        # Extract data
+                        data = event.get("data", {})
+                        
+                        # DEBUG: Log message structure
+                        print(f"   🔍 DEBUG: Message data keys: {list(data.keys())}")
+                        if "text" in data:
+                            print(f"   🔍 DEBUG: Text content: '{data.get('text', '')[:50]}...'")
+                        if "audio" in data:
+                            print(f"   🔍 DEBUG: Audio data present")
+                        if "attachments" in data:
+                            print(f"   🔍 DEBUG: Attachments: {len(data.get('attachments', []))} items")
+                        
+                        # Determine message type
+                        if event_type == "message.received":
+                            # Check for audio
+                            has_audio = False
+                            audio_data_to_process = None
                             
-                            # Determine message type
-                            if event_type == "message.received":
-                                # Check for audio
-                                has_audio = False
-                                audio_data_to_process = None
-                                
-                                # Logic to find audio (same as sync consumer)
-                                if "audio" in data:
-                                    has_audio = True
-                                    audio_data_to_process = data
-                                elif isinstance(data.get("message"), dict) and "audio" in data.get("message", {}):
-                                    has_audio = True
-                                    audio_data_to_process = data.copy()
-                                    audio_data_to_process["audio"] = data["message"]["audio"]
-                                elif isinstance(data.get("attachments"), list):
-                                    for att in data.get("attachments", []):
-                                        if isinstance(att, dict) and (att.get("type") == "audio" or att.get("mime_type", "").startswith("audio/")):
-                                            has_audio = True
-                                            audio_data_to_process = data.copy()
-                                            audio_data_to_process["audio"] = {
-                                                "format": att.get("format", "opus"),
-                                                "data": att.get("data") or att.get("base64_data"),
-                                                "url": att.get("url")
-                                            }
-                                            break
-                                
-                                if has_audio and audio_data_to_process:
-                                    # Process audio synchronously to ensure commit happens after success
+                            # Logic to find audio (same as sync consumer)
+                            if "audio" in data:
+                                has_audio = True
+                                audio_data_to_process = data
+                                print(f"   🔍 DEBUG: Found audio in data.audio")
+                            elif isinstance(data.get("message"), dict) and "audio" in data.get("message", {}):
+                                has_audio = True
+                                audio_data_to_process = data.copy()
+                                audio_data_to_process["audio"] = data["message"]["audio"]
+                                print(f"   🔍 DEBUG: Found audio in data.message.audio")
+                            elif isinstance(data.get("attachments"), list):
+                                for att in data.get("attachments", []):
+                                    if isinstance(att, dict) and (att.get("type") == "audio" or att.get("mime_type", "").startswith("audio/")):
+                                        has_audio = True
+                                        audio_data_to_process = data.copy()
+                                        audio_data_to_process["audio"] = {
+                                            "format": att.get("format", "opus"),
+                                            "data": att.get("data") or att.get("base64_data"),
+                                            "url": att.get("url")
+                                        }
+                                        print(f"   🔍 DEBUG: Found audio in attachments")
+                                        break
+                            
+                            if has_audio and audio_data_to_process:
+                                # Process audio synchronously to ensure commit happens after success
+                                print(f"   🎤 Processing as AUDIO message...")
+                                try:
+                                    await process_audio_message(session, audio_data_to_process)
+                                    await consumer.commit()
+                                    print(f"   ✅ Offset {msg.offset} committed successfully")
+                                except Exception as e:
+                                    print(f"   ❌ Error processing audio: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    # Don't commit on error - will retry
+                                    # Re-raise to stop consumer and retry on restart
+                                    raise
+                            elif "text" in data and data.get("text", "").strip():
+                                # Process text synchronously to ensure commit happens after success
+                                print(f"   💬 Processing as TEXT message...")
+                                try:
+                                    await process_text_message(session, data)
+                                    await consumer.commit()
+                                    print(f"   ✅ Offset {msg.offset} committed successfully")
+                                except Exception as e:
+                                    print(f"   ❌ Error processing text: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    # Don't commit on error - will retry
+                                    # Re-raise to stop consumer and retry on restart
+                                    raise
+                            elif "text" in data and not data.get("text", "").strip():
+                                # Empty text - might be a voice memo with no transcript
+                                print(f"   ⚠️  Empty text field - checking for audio...")
+                                if has_audio:
+                                    print(f"   🎤 Processing as AUDIO (empty text)...")
                                     try:
-                                        await process_audio_message(session, audio_data_to_process)
+                                        await process_audio_message(session, audio_data_to_process or data)
                                         await consumer.commit()
                                         print(f"   ✅ Offset {msg.offset} committed successfully")
                                     except Exception as e:
                                         print(f"   ❌ Error processing audio: {e}")
-                                        import traceback
                                         traceback.print_exc()
-                                        # Don't commit on error - will retry
-                                        # Re-raise to stop consumer and retry on restart
-                                        raise
-                                elif "text" in data:
-                                    # Process text synchronously to ensure commit happens after success
-                                    try:
-                                        await process_text_message(session, data)
-                                        await consumer.commit()
-                                        print(f"   ✅ Offset {msg.offset} committed successfully")
-                                    except Exception as e:
-                                        print(f"   ❌ Error processing text: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                        # Don't commit on error - will retry
-                                        # Re-raise to stop consumer and retry on restart
                                         raise
                                 else:
-                                    # Unknown message format - commit to skip
-                                    print("⚠️  Unknown message format")
+                                    print(f"   ⚠️  Empty text and no audio - skipping")
                                     await consumer.commit()
-                            
-                            elif event_type == "typing_indicator.received":
-                                print(f"   ⌨️  User is typing...")
-                                await consumer.commit()
-                            
                             else:
-                                # Other event types - commit to acknowledge
+                                # Unknown message format - log details before skipping
+                                print(f"   ⚠️  Unknown message format - data keys: {list(data.keys())}")
+                                print(f"   ⚠️  Full data: {json.dumps(data, indent=2)[:500]}...")
                                 await consumer.commit()
                             
-                        except Exception as e:
+                        elif event_type == "typing_indicator.received":
+                            print(f"   ⌨️  User is typing...")
+                            await consumer.commit()
+                        
+                        else:
+                            # Other event types - commit to acknowledge
+                            await consumer.commit()
+                    
+                    except Exception as e:
                             print(f"\n❌ ERROR processing message at offset {msg.offset}: {e}")
                             print(f"   Error Type: {type(e).__name__}")
+                            print(f"   Event Type: {event.get('event_type', 'UNKNOWN')}")
+                            print(f"   Event ID: {event.get('event_id', 'N/A')}")
+                            try:
+                                print(f"   Data keys: {list(event.get('data', {}).keys())}")
+                            except:
+                                pass
                             traceback.print_exc()
                             print(f"{'='*60}\n")
                             # Don't commit on error - will retry on restart
                             # This ensures we don't lose messages
+                            # But we should log this so we can debug
+                            continue  # Continue to next message instead of stopping
                     
         finally:
             print("👋 Stopping consumer...")
