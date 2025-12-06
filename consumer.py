@@ -242,8 +242,8 @@ async def text_to_speech(text: str, language: str = "en", output_file: str = Non
         
         os.makedirs("audio_files", exist_ok=True)
         
-        # Call Cartesia
-        result_file = await cartesia_generate_speech(text, output_file)
+        # Call Cartesia with language parameter for multilingual support
+        result_file = await cartesia_generate_speech(text, output_file, language=language)
         
         if result_file and os.path.exists(result_file):
             print(f"   ✅ TTS audio saved: {result_file}")
