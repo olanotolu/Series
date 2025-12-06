@@ -43,7 +43,7 @@ export default function Home() {
             name={aiFriend.name}
             isAI={true}
             delay={0.2}
-          />
+            />
           <FloatingAvatar
             avatar={user.avatar}
             name={user.name}

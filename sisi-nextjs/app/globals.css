@@ -202,7 +202,7 @@ body {
   overflow: hidden;
   transition: all 0.3s ease;
   z-index: 10;
-}
+  }
 
 .floating-avatar:active {
   cursor: grabbing;
