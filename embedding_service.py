@@ -95,9 +95,11 @@ Hobbies: {hobbies}
         print(f"   🧠 Generating embedding for: {name} ({school}, {age})")
         
         # Call OpenAI embeddings API
+        # text-embedding-3-large returns 3072 by default, but we need 1536 for pgvector
         response = client.embeddings.create(
             model="text-embedding-3-large",
-            input=personality_text.strip()
+            input=personality_text.strip(),
+            dimensions=1536  # Specify 1536 dimensions to match database schema
         )
         
         vector = response.data[0].embedding
