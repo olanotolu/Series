@@ -32,6 +32,10 @@ from aiokafka.errors import KafkaError
 # Reuse existing utilities (will be run in executor if blocking)
 from opus_to_wav import opus_to_wav
 from dlq_handler import send_to_dlq, classify_error, is_recoverable_error
+from onboarding_flow import (
+    get_onboarding_greeting, get_question, get_next_state,
+    validate_answer, get_completion_message, format_profile_summary
+)
 
 # Session Manager (Supabase) - optional
 try:
@@ -197,9 +201,10 @@ async def transcribe_audio(filename: str, language: str = None) -> tuple:
         return None, None
 
 
-async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "") -> str:
+async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "", profile: dict = None) -> str:
     """Get response from LLM using Hugging Face Inference API.
-    Responds in the detected language (English, Hindi, or French)."""
+    Responds in the detected language (English, Hindi, or French).
+    Uses user profile for personalized responses."""
     global hf_client
     
     if hf_client is None:
@@ -220,9 +225,29 @@ async def get_llm_response(text: str, history: list = None, language: str = "en"
         lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
         lang_name = lang_names.get(language, "English")
         
+        # Build profile section
+        profile_section = ""
+        if profile:
+            profile_parts = []
+            if profile.get("name"):
+                profile_parts.append(f"Name: {profile['name']}")
+            if profile.get("school"):
+                profile_parts.append(f"School: {profile['school']}")
+            if profile.get("age"):
+                profile_parts.append(f"Age: {profile['age']}")
+            if profile.get("hobbies"):
+                profile_parts.append(f"Hobbies: {profile['hobbies']}")
+            
+            if profile_parts:
+                profile_section = f"""
+USER PROFILE:
+{chr(10).join(profile_parts)}
+
+Use this information to personalize your responses. Reference their name, school, or hobbies naturally in conversation. For example, if they mention their hobby, show interest. If they're in school, you can ask about classes or activities."""
+        
         system_prompt = f"""You are a friendly, helpful friend chatting on Series.so, a social network platform. 
 You're having a casual conversation with someone you know.
-
+{profile_section}
 CRITICAL LANGUAGE RULE: The user is speaking in {lang_name}. {lang_instruction}
 You MUST match their language exactly. If they say "Hi" in English, you respond in English. If they say "Bonjour" in French, you respond in French. If they say "नमस्ते" in Hindi, you respond in Hindi.
 
@@ -858,19 +883,113 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     
     print(f"\n📥 INCOMING TEXT MESSAGE from {sender}: {text}")
 
-    # HARD RESET COMMAND
+    loop = asyncio.get_event_loop()
+    
+    # Check onboarding status
+    is_complete = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.is_onboarding_complete, sender)
+    onboarding_state = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_onboarding_state, sender)
+    
+    print(f"   🔍 Onboarding check: complete={is_complete}, state={onboarding_state}")
+    
+    # Enhanced /reset command with confirmation
     if text.strip().lower() == "/reset":
-        print(f"   🔄 Executing HARD RESET for {sender}...")
+        print(f"   🔄 /reset command received for {sender}...")
         
-        # Run in executor to avoid blocking
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_history, sender)
+        # Get profile data
+        profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
         
-        welcome_msg = "🔄 Memory wiped. Let's start over! \n\nI'm your AI companion. Tell me a bit about yourself—what's your name and what do you like to do?"
-        await send_text(session, chat_id, welcome_msg)
-        print("   ✅ Reset complete and welcome message sent.")
+        # Format profile summary
+        profile_summary = format_profile_summary(profile)
+        reset_message = f"{profile_summary}\n\n⚠️ Are you sure you want to reset? This will delete all your data.\n\nReply YES to confirm, or anything else to cancel."
+        
+        await send_text(session, chat_id, reset_message)
+        
+        # Set state to reset_confirmation
+        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "reset_confirmation")
+        print("   ✅ Reset confirmation prompt sent.")
         return
     
+    # Handle reset confirmation
+    if onboarding_state == "reset_confirmation":
+        if text.strip().upper() == "YES":
+            print(f"   ✅ Reset confirmed - wiping data for {sender}...")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_profile, sender)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_history, sender)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            
+            # Start onboarding
+            greeting = get_onboarding_greeting()
+            await send_text(session, chat_id, greeting)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "greeting")
+            print("   ✅ Reset complete - onboarding restarted.")
+            return
+        else:
+            # Cancel reset
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            await send_text(session, chat_id, "✅ Reset cancelled. Your data is safe!")
+            print("   ✅ Reset cancelled.")
+            return
+    
+    # Handle onboarding flow
+    if not is_complete:
+        print(f"   🎯 Entering onboarding flow (complete={is_complete}, state={onboarding_state})")
+        await start_typing(session, chat_id)
+        
+        # If no state, start onboarding
+        if not onboarding_state or onboarding_state == "greeting":
+            print(f"   🚀 Starting onboarding - sending greeting and first question")
+            greeting = get_onboarding_greeting()
+            first_question = get_question("name")
+            await send_text(session, chat_id, f"{greeting}\n\n{first_question}")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "name")
+            await stop_typing(session, chat_id)
+            print(f"   ✅ Onboarding started - state set to 'name'")
+            return
+        
+        # Process onboarding answer
+        is_valid, error_msg = validate_answer(onboarding_state, text)
+        
+        if not is_valid:
+            question = get_question(onboarding_state)
+            await send_text(session, chat_id, f"❌ {error_msg}\n\n{question}")
+            await stop_typing(session, chat_id)
+            return
+        
+        # Save answer
+        profile_update = {}
+        if onboarding_state == "name":
+            profile_update["name"] = text.strip()
+        elif onboarding_state == "school":
+            profile_update["school"] = text.strip()
+        elif onboarding_state == "age":
+            profile_update["age"] = int(text.strip())
+        elif onboarding_state == "hobbies":
+            profile_update["hobbies"] = text.strip()
+        
+        # Update profile
+        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.update_profile, sender, **profile_update)
+        
+        # Move to next state
+        next_state = get_next_state(onboarding_state)
+        
+        if next_state == "complete":
+            # Mark onboarding complete
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.update_profile, sender, onboarding_complete=True, onboarding_state="complete")
+            profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+            completion_msg = get_completion_message(profile)
+            await send_text(session, chat_id, completion_msg)
+            await stop_typing(session, chat_id)
+            return
+        else:
+            # Ask next question
+            next_question = get_question(next_state)
+            await send_text(session, chat_id, f"Got it! 👍\n\n{next_question}")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, next_state)
+            await stop_typing(session, chat_id)
+            return
+    
+    # Normal conversation flow (onboarding complete)
+    print(f"   💬 Onboarding complete - using normal conversation flow")
     # Detect language
     detected_language = await detect_language(text)
     lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
@@ -879,16 +998,15 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     
     await start_typing(session, chat_id)
     
-    # Get user history (run in executor)
-    # Get user history and behavioral context
-    loop = asyncio.get_event_loop()
+    # Get user history and profile
     history = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_history, sender)
     behavior_context = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.analyze_behavior, sender)
+    profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
     
     print(f"   🧠 Behavioral Context: {behavior_context}")
     
     try:
-        reply = await get_llm_response(text, history, language=detected_language or "en", behavior_context=behavior_context)
+        reply = await get_llm_response(text, history, language=detected_language or "en", behavior_context=behavior_context, profile=profile)
         print(f"   💬 LLM Response ({lang_name}): {reply[:100]}...")
         
         # Save context (run in executor)

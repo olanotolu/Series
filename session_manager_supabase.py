@@ -166,3 +166,133 @@ class SessionManager:
         except Exception as e:
             print(f"Error analyzing behavior: {e}")
             return "User state: Normal."
+
+    def get_profile(self, user_id: str) -> Dict:
+        """Get user profile (name, school, age, hobbies)."""
+        if not self.supabase:
+            return {}
+        
+        try:
+            response = self.supabase.table("sessions").select("name, school, age, hobbies, onboarding_complete").eq("user_id", user_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                row = response.data[0]
+                return {
+                    "name": row.get("name"),
+                    "school": row.get("school"),
+                    "age": row.get("age"),
+                    "hobbies": row.get("hobbies"),
+                    "onboarding_complete": row.get("onboarding_complete", False)
+                }
+            return {}
+        except Exception as e:
+            print(f"   ⚠️  Supabase get_profile error: {e}")
+            return {}
+
+    def update_profile(self, user_id: str, **kwargs):
+        """Update user profile fields (name, school, age, hobbies)."""
+        if not self.supabase:
+            return
+        
+        try:
+            # Get existing data
+            response = self.supabase.table("sessions").select("*").eq("user_id", user_id).execute()
+            
+            data = {"user_id": user_id}
+            
+            # Update only provided fields
+            if "name" in kwargs:
+                data["name"] = kwargs["name"]
+            if "school" in kwargs:
+                data["school"] = kwargs["school"]
+            if "age" in kwargs:
+                data["age"] = kwargs["age"]
+            if "hobbies" in kwargs:
+                data["hobbies"] = kwargs["hobbies"]
+            if "onboarding_complete" in kwargs:
+                data["onboarding_complete"] = kwargs["onboarding_complete"]
+            if "onboarding_state" in kwargs:
+                data["onboarding_state"] = kwargs["onboarding_state"]
+            
+            # Upsert
+            self.supabase.table("sessions").upsert(data).execute()
+        except Exception as e:
+            print(f"   ⚠️  Supabase update_profile error: {e}")
+
+    def clear_profile(self, user_id: str):
+        """Clear profile data but keep conversation history."""
+        if not self.supabase:
+            return
+        
+        try:
+            # Get existing history
+            response = self.supabase.table("sessions").select("history").eq("user_id", user_id).execute()
+            history = []
+            if response.data and len(response.data) > 0:
+                raw_history = response.data[0].get("history", [])
+                if isinstance(raw_history, str):
+                    try:
+                        history = json.loads(raw_history)
+                    except:
+                        pass
+                elif isinstance(raw_history, list):
+                    history = raw_history
+            
+            # Clear profile but keep history
+            data = {
+                "user_id": user_id,
+                "history": history,
+                "name": None,
+                "school": None,
+                "age": None,
+                "hobbies": None,
+                "onboarding_complete": False,
+                "onboarding_state": None
+            }
+            self.supabase.table("sessions").upsert(data).execute()
+        except Exception as e:
+            print(f"   ⚠️  Supabase clear_profile error: {e}")
+
+    def get_onboarding_state(self, user_id: str) -> str:
+        """Get current onboarding state (name, school, age, hobbies, complete, or None)."""
+        if not self.supabase:
+            return None
+        
+        try:
+            response = self.supabase.table("sessions").select("onboarding_state").eq("user_id", user_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0].get("onboarding_state")
+            return None
+        except Exception as e:
+            print(f"   ⚠️  Supabase get_onboarding_state error: {e}")
+            return None
+
+    def set_onboarding_state(self, user_id: str, state: str):
+        """Set onboarding state (name, school, age, hobbies, complete, or None)."""
+        if not self.supabase:
+            return
+        
+        try:
+            data = {
+                "user_id": user_id,
+                "onboarding_state": state
+            }
+            self.supabase.table("sessions").upsert(data).execute()
+        except Exception as e:
+            print(f"   ⚠️  Supabase set_onboarding_state error: {e}")
+
+    def is_onboarding_complete(self, user_id: str) -> bool:
+        """Check if user has completed onboarding."""
+        if not self.supabase:
+            return False
+        
+        try:
+            response = self.supabase.table("sessions").select("onboarding_complete").eq("user_id", user_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0].get("onboarding_complete", False)
+            return False
+        except Exception as e:
+            print(f"   ⚠️  Supabase is_onboarding_complete error: {e}")
+            return False

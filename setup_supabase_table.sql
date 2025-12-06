@@ -6,7 +6,14 @@ CREATE TABLE IF NOT EXISTS public.sessions (
     history JSONB DEFAULT '[]'::jsonb,
     last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    -- Profile fields
+    name TEXT,
+    school TEXT,
+    age INTEGER,
+    hobbies TEXT,
+    onboarding_complete BOOLEAN DEFAULT false,
+    onboarding_state TEXT
 );
 
 -- Create index for faster lookups
