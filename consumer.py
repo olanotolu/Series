@@ -204,10 +204,11 @@ async def transcribe_audio(filename: str, language: str = None) -> tuple:
         return None, None
 
 
-async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "", profile: dict = None) -> str:
+async def get_llm_response(text: str, history: list = None, language: str = "en", behavior_context: str = "", profile: dict = None, group_context: dict = None) -> str:
     """Get response from LLM using Hugging Face Inference API.
     Responds in the detected language (English, Hindi, or French).
-    Uses user profile for personalized responses."""
+    Uses user profile for personalized responses.
+    Supports group chat context for multi-user conversations."""
     global hf_client
     
     if hf_client is None:
@@ -248,9 +249,58 @@ USER PROFILE:
 
 Use this information to personalize your responses. Reference their name, school, or hobbies naturally in conversation. For example, if they mention their hobby, show interest. If they're in school, you can ask about classes or activities."""
         
+        # Build group chat context section
+        group_section = ""
+        if group_context and group_context.get("is_group_chat"):
+            participants = group_context.get("participants", [])
+            recent_messages = group_context.get("recent_messages", [])
+            display_name = group_context.get("display_name", "Group Chat")
+            
+            participant_info = []
+            for p in participants:
+                parts = []
+                if p.get("name"):
+                    parts.append(p["name"])
+                if p.get("school"):
+                    parts.append(f"({p['school']})")
+                if p.get("age"):
+                    parts.append(f"age {p['age']}")
+                if parts:
+                    participant_info.append(" ".join(parts))
+            
+            group_section = f"""
+GROUP CHAT CONTEXT:
+You are in a group chat called "{display_name}" with {len(participants)} other people.
+Participants: {', '.join(participant_info) if participant_info else 'Multiple users'}
+
+IMPORTANT GROUP CHAT RULES:
+1. You matched these people because they share common interests. Help facilitate conversation between them.
+2. Keep your responses brief and engaging - you're part of a group conversation, not a one-on-one.
+3. Reference what others have said when relevant. Show you're paying attention to the whole conversation.
+4. Encourage interaction between the participants. Ask questions that involve everyone.
+5. Be friendly and inclusive. Make sure everyone feels included in the conversation.
+6. If someone asks a question, you can answer, but also try to get others involved.
+
+Recent conversation context:
+"""
+            # Add last few messages for context
+            for msg in recent_messages[-5:]:  # Last 5 messages
+                from_phone = msg.get("from_phone", "Unknown")
+                msg_text = msg.get("text", "")
+                is_ai = msg.get("is_from_ai", False)
+                if not is_ai and msg_text:
+                    # Find participant name
+                    participant_name = "Someone"
+                    for p in participants:
+                        if p.get("user_id") == msg.get("from_user_id"):
+                            participant_name = p.get("name", "Someone")
+                            break
+                    group_section += f"- {participant_name}: {msg_text}\n"
+        
         system_prompt = f"""You are a friendly, helpful friend chatting on Series.so, a social network platform. 
 You're having a casual conversation with someone you know.
 {profile_section}
+{group_section}
 CRITICAL LANGUAGE RULE: The user is speaking in {lang_name}. {lang_instruction}
 You MUST match their language exactly. If they say "Hi" in English, you respond in English. If they say "Bonjour" in French, you respond in French. If they say "नमस्ते" in Hindi, you respond in Hindi.
 
@@ -573,11 +623,13 @@ async def create_group_chat(session: aiohttp.ClientSession, user_phone: str, mat
     intro_message = f"Hey! I matched you two because you both love {hobbies_str}. Say hi!"
     
     # Payload for group chat creation
+    # Note: AI is NOT included as participant (causes 403 error)
+    # AI will still receive messages if it's subscribed to the chat via Series API
     payload = {
         "send_from": SENDER_NUMBER,
         "chat": {
             "display_name": display_name,
-            "phone_numbers": [user_phone, match_phone, SENDER_NUMBER]
+            "phone_numbers": [user_phone, match_phone]  # Only the two matched users
         },
         "message": {
             "text": intro_message
@@ -586,7 +638,8 @@ async def create_group_chat(session: aiohttp.ClientSession, user_phone: str, mat
     
     print(f"\n📤 CREATING GROUP CHAT:")
     print(f"   Display Name: {display_name}")
-    print(f"   Participants: {user_phone}, {match_phone}, {SENDER_NUMBER}")
+    print(f"   Participants: {user_phone}, {match_phone}")
+    print(f"   Sending from: {SENDER_NUMBER} (AI - will receive messages via API)")
     print(f"   Intro Message: {intro_message}")
     
     try:
@@ -606,6 +659,30 @@ async def create_group_chat(session: aiohttp.ClientSession, user_phone: str, mat
             chat_id = response.get('data', {}).get('id')
             if chat_id:
                 print(f"   ✅ Group chat created! Chat ID: {chat_id}")
+                
+                # Store group chat in database
+                try:
+                    from group_chat_manager import (
+                        create_group_chat_record,
+                        add_group_chat_participant
+                    )
+                    
+                    # Create group chat record
+                    group_chat_db_id = create_group_chat_record(str(chat_id), display_name)
+                    
+                    if group_chat_db_id:
+                        # Add participants (AI not included since it's not a participant)
+                        add_group_chat_participant(group_chat_db_id, user_phone, user_phone, is_ai=False)
+                        add_group_chat_participant(group_chat_db_id, match_phone, match_phone, is_ai=False)
+                        # Note: AI is not a participant, but can still send/receive messages via API
+                        print(f"   ✅ Group chat stored in database (ID: {group_chat_db_id})")
+                    else:
+                        print(f"   ⚠️  Failed to store group chat in database")
+                except Exception as e:
+                    print(f"   ⚠️  Error storing group chat: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
                 return str(chat_id)
             else:
                 print(f"   ⚠️  No chat ID in response: {response}")
@@ -961,10 +1038,124 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     chat_id = event_data.get("chat_id")
     text = event_data.get("text", "")
     sender = event_data.get("from_phone", "")
+    message_id = event_data.get("id", "")
     
     print(f"\n📥 INCOMING TEXT MESSAGE from {sender}: {text}")
 
     loop = asyncio.get_event_loop()
+    
+    # Check if this is a group chat
+    # Method 1: Check database (for chats created by our system)
+    # Method 2: Check chat_handles (for manually created chats)
+    is_group_chat = False
+    group_chat_info = None
+    chat_handles = event_data.get("chat_handles", [])
+    
+    # Detect group chat by number of participants (chat_handles)
+    # Group chat = more than 1 participant (excluding AI)
+    if isinstance(chat_handles, list):
+        # Count unique participants (excluding AI)
+        unique_participants = set()
+        for handle in chat_handles:
+            phone = None
+            if isinstance(handle, str):
+                phone = handle
+            elif isinstance(handle, dict):
+                phone = handle.get('phone_number') or handle.get('phone')
+            
+            if phone and phone != SENDER_NUMBER:
+                unique_participants.add(phone)
+        
+        if len(unique_participants) > 1:
+            is_group_chat = True
+            print(f"   👥 Group chat detected: {len(unique_participants)} participants (via chat_handles)")
+    
+    # Also check database
+    try:
+        from group_chat_manager import get_group_chat_by_chat_id, store_group_chat_message, get_group_chat_profiles, get_group_chat_history
+        
+        group_chat_info = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_group_chat_by_chat_id, str(chat_id))
+        if group_chat_info:
+            is_group_chat = True
+            print(f"   👥 Group chat detected in DB: {group_chat_info.get('display_name')}")
+            
+            # Store message in group chat history
+            if message_id:
+                await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    store_group_chat_message,
+                    group_chat_info.get('id'),
+                    message_id,
+                    sender,
+                    None,  # user_id will be looked up if needed
+                    text,
+                    False  # is_from_ai
+                )
+        elif is_group_chat and not group_chat_info:
+            # Group chat exists but not in DB - create record for tracking
+            print(f"   📝 Group chat not in DB, creating record...")
+            try:
+                from group_chat_manager import create_group_chat_record, add_group_chat_participant
+                
+                # Extract display name from chat_handles or use default
+                display_name = f"Group Chat {chat_id[:8]}"
+                if chat_handles and len(chat_handles) >= 2:
+                    # Try to get names from profiles
+                    names = []
+                    for handle in chat_handles[:2]:  # First 2 participants
+                        if handle.get('phone_number'):
+                            profile = await loop.run_in_executor(
+                                CPU_BOUND_EXECUTOR,
+                                session_manager.get_profile,
+                                handle.get('phone_number')
+                            )
+                            if profile and profile.get('name'):
+                                names.append(profile.get('name'))
+                    if len(names) >= 2:
+                        display_name = f"{names[0]} & {names[1]}"
+                
+                group_chat_db_id = await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    create_group_chat_record,
+                    str(chat_id),
+                    display_name
+                )
+                
+                if group_chat_db_id:
+                    # Add participants
+                    for handle in chat_handles:
+                        phone = handle.get('phone_number') or handle.get('phone')
+                        if phone:
+                            is_ai = (phone == SENDER_NUMBER)
+                            await loop.run_in_executor(
+                                CPU_BOUND_EXECUTOR,
+                                add_group_chat_participant,
+                                group_chat_db_id,
+                                phone if not is_ai else None,
+                                phone,
+                                is_ai
+                            )
+                    
+                    # Reload group_chat_info
+                    group_chat_info = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        get_group_chat_by_chat_id,
+                        str(chat_id)
+                    )
+                    print(f"   ✅ Group chat record created (ID: {group_chat_db_id})")
+            except Exception as e:
+                print(f"   ⚠️  Error creating group chat record: {e}")
+                import traceback
+                traceback.print_exc()
+    except Exception as e:
+        print(f"   ⚠️  Error checking group chat: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Skip if message is from AI (prevent feedback loop)
+    if sender == SENDER_NUMBER:
+        print(f"   ⚠️  Ignoring message from AI (feedback loop prevention)")
+        return
     
     # Check onboarding status
     is_complete = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.is_onboarding_complete, sender)
@@ -1015,7 +1206,7 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     if onboarding_state == "match_confirmation":
         # Check for "yes" variations (case-insensitive)
         text_lower = text.strip().lower()
-        yes_variations = ["yes", "yeah", "sure", "ok", "yep", "okay", "y", "okay", "sounds good", "let's do it", "go ahead"]
+        yes_variations = ["yes", "yeah", "yea", "sure", "ok", "yep", "okay", "y", "sounds good", "let's do it", "go ahead"]
         
         if any(text_lower == variant or text_lower.startswith(variant + " ") or text_lower.endswith(" " + variant) for variant in yes_variations):
             # User confirmed - create group chat
@@ -1062,9 +1253,10 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                 )
                 
                 if group_chat_id:
-                    # Record match in database
+                    # Record match in database and link to group chat
                     def record_match():
                         from embedding_service import get_supabase_client
+                        from group_chat_manager import get_group_chat_by_chat_id
                         client = get_supabase_client()
                         if client:
                             # Get match score from previous match
@@ -1077,12 +1269,25 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                                             match_score = m.get('score', 0.0)
                                             break
                                 
-                                client.table('matches').insert({
+                                # Insert match
+                                match_response = client.table('matches').insert({
                                     'user1_id': sender,
                                     'user2_id': match_user_id,
                                     'score': match_score,
                                     'status': 'accepted'
                                 }).execute()
+                                
+                                match_db_id = match_response.data[0].get('id') if match_response.data else None
+                                
+                                # Link group chat to match
+                                if match_db_id:
+                                    group_chat_info = get_group_chat_by_chat_id(str(group_chat_id))
+                                    if group_chat_info:
+                                        client.table('group_chats').update({
+                                            'match_id': match_db_id
+                                        }).eq('id', group_chat_info.get('id')).execute()
+                                        print(f"   ✅ Group chat linked to match")
+                                
                                 print(f"   ✅ Match recorded in database: {sender} ↔ {match_user_id} (score: {match_score:.2%})")
                             except Exception as e:
                                 print(f"   ⚠️  Error recording match: {e}")
@@ -1259,8 +1464,89 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     
     print(f"   🧠 Behavioral Context: {behavior_context}")
     
+    # If group chat, get group context
+    group_context = None
+    if is_group_chat:
+        try:
+            participants = []
+            display_name = "Group Chat"
+            group_history = []
+            
+            if group_chat_info:
+                # Group chat is in database - get full context
+                from group_chat_manager import get_group_chat_profiles, get_group_chat_history
+                
+                participants = await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    get_group_chat_profiles,
+                    group_chat_info.get('id')
+                )
+                
+                group_history = await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    get_group_chat_history,
+                    group_chat_info.get('id'),
+                    20  # Last 20 messages
+                )
+                
+                display_name = group_chat_info.get('display_name', 'Group Chat')
+            else:
+                # Group chat not in DB - build context from chat_handles
+                display_name = f"Group Chat {chat_id[:8]}"
+                
+                # Get profiles for participants from chat_handles
+                if isinstance(chat_handles, list):
+                    seen_phones = set()
+                    for handle in chat_handles:
+                        phone = None
+                        if isinstance(handle, str):
+                            phone = handle
+                        elif isinstance(handle, dict):
+                            phone = handle.get('phone_number') or handle.get('phone')
+                        
+                        if phone and phone != SENDER_NUMBER and phone not in seen_phones:
+                            seen_phones.add(phone)
+                            profile = await loop.run_in_executor(
+                                CPU_BOUND_EXECUTOR,
+                                session_manager.get_profile,
+                                phone
+                            )
+                            if profile:
+                                participants.append(profile)
+                            else:
+                                # Add basic info if no profile
+                                participants.append({
+                                    "phone": phone,
+                                    "name": phone[-4:]  # Last 4 digits as identifier
+                                })
+                    
+                    # Try to create display name from participant names
+                    if len(participants) >= 2:
+                        names = [p.get('name', '') for p in participants[:2] if p.get('name')]
+                        if len(names) >= 2:
+                            display_name = f"{names[0]} & {names[1]}"
+            
+            group_context = {
+                "is_group_chat": True,
+                "display_name": display_name,
+                "participants": participants,
+                "recent_messages": group_history
+            }
+            print(f"   👥 Group context: {len(participants)} participants, {len(group_history)} recent messages")
+        except Exception as e:
+            print(f"   ⚠️  Error getting group context: {e}")
+            import traceback
+            traceback.print_exc()
+    
     try:
-        reply = await get_llm_response(text, history, language=detected_language or "en", behavior_context=behavior_context, profile=profile)
+        reply = await get_llm_response(
+            text, 
+            history, 
+            language=detected_language or "en", 
+            behavior_context=behavior_context, 
+            profile=profile,
+            group_context=group_context
+        )
         print(f"   💬 LLM Response ({lang_name}): {reply[:100]}...")
         
         # Save context (run in executor)
@@ -1268,6 +1554,23 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             session_manager.add_message(sender, "user", text)
             session_manager.add_message(sender, "assistant", reply)
         await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_context)
+        
+        # Store AI response in group chat if applicable
+        if is_group_chat and group_chat_info and message_id:
+            try:
+                from group_chat_manager import store_group_chat_message
+                await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    store_group_chat_message,
+                    group_chat_info.get('id'),
+                    f"ai_{message_id}",  # AI message ID
+                    SENDER_NUMBER,
+                    None,
+                    reply,
+                    True  # is_from_ai
+                )
+            except Exception as e:
+                print(f"   ⚠️  Error storing AI message in group chat: {e}")
         
     except Exception as e:
         print(f"   ⚠️  LLM error: {e}")

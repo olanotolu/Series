@@ -43,6 +43,8 @@ def find_matches(user_id: str, limit: int = 5) -> List[Dict]:
         print(f"   ⚠️  No embedding found for {user_id}")
         return []
     
+    # Try RPC first, but fallback is more reliable
+    # The RPC function has issues with vector type conversion in Supabase
     try:
         # Call PostgreSQL function via Supabase RPC
         # Pass vector as list - Supabase will handle conversion
@@ -57,11 +59,24 @@ def find_matches(user_id: str, limit: int = 5) -> List[Dict]:
         
         matches = result.data if result.data else []
         
-        print(f"   ✅ Found {len(matches)} match(es) for {user_id}")
-        return matches
+        # If RPC returns results, use them
+        if len(matches) > 0:
+            print(f"   ✅ Found {len(matches)} match(es) via RPC for {user_id}")
+            return matches
+        
+        # RPC returned empty - check if there are other users
+        check_response = client.table('user_embeddings').select('user_id').neq('user_id', user_id).limit(1).execute()
+        if check_response.data and len(check_response.data) > 0:
+            # Other users exist but RPC returned empty - use fallback
+            print(f"   ⚠️  RPC returned 0 matches but other users exist, using fallback method...")
+            return find_matches_fallback(user_id, limit)
+        
+        # No other users exist
+        print(f"   ℹ️  No other users with embeddings found")
+        return []
         
     except Exception as e:
-        print(f"   ❌ Error finding matches: {e}")
+        print(f"   ⚠️  RPC error (using fallback): {e}")
         # Fallback: try direct query if RPC doesn't work
         return find_matches_fallback(user_id, limit)
 
