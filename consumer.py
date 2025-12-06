@@ -139,11 +139,28 @@ async def init_hf_client():
     
     try:
         print("🤖 Initializing Hugging Face Async Inference API client...")
+        print(f"   🔑 Using HF token: {HF_TOKEN[:20]}..." if HF_TOKEN and len(HF_TOKEN) > 20 else f"   🔑 HF token length: {len(HF_TOKEN) if HF_TOKEN else 0}")
         hf_client = AsyncInferenceClient(token=HF_TOKEN)
+        
+        # Test the client with a simple call to verify it works
+        print("   🧪 Testing HF client with a simple request...")
+        try:
+            # This is just to verify the client works - we'll catch any errors
+            test_response = await hf_client.chat_completion(
+                messages=[{"role": "user", "content": "Say hello"}],
+                model="meta-llama/Llama-3.2-3B-Instruct",
+                max_tokens=10
+            )
+            print(f"   ✅ HF client test successful! Response type: {type(test_response)}")
+        except Exception as test_error:
+            print(f"   ⚠️  HF client test failed: {test_error}")
+            print(f"   ⚠️  This might indicate an API issue, but continuing anyway...")
+        
         print("✅ Hugging Face Async Inference API client initialized!")
         return True
     except Exception as e:
         print(f"❌ Error initializing HF client: {e}")
+        print(f"❌ Error type: {type(e).__name__}")
         traceback.print_exc()
         return False
 
@@ -213,7 +230,13 @@ async def get_llm_response(text: str, history: list = None, language: str = "en"
     
     if hf_client is None:
         if not await init_hf_client():
-            return f"You said: {text}"
+            print(f"   ❌ HF client initialization failed, using friendly fallback")
+            fallbacks = {
+                "en": f"Hey! 👋 Nice to hear from you!",
+                "hi": f"नमस्ते! 👋 आपसे बात करके अच्छा लगा!",
+                "fr": f"Salut! 👋 Ravi de te parler!"
+            }
+            return fallbacks.get(language, fallbacks["en"])
     
     try:
         print(f"   🤖 Getting LLM response via Async Inference API...")
@@ -383,19 +406,60 @@ You can use emojis occasionally to add personality, but don't overdo it. Be your
         messages.append({"role": "user", "content": user_message})
         
         # Use Meta-Llama-3.2-3B-Instruct (reliable and fast via API, supports multilingual)
-        response = await hf_client.chat_completion(
-            messages=messages,
-            model="meta-llama/Llama-3.2-3B-Instruct",
-            max_tokens=512
-        )
-        
-        reply = response.choices[0].message.content.strip()
+        try:
+            response = await hf_client.chat_completion(
+                messages=messages,
+                model="meta-llama/Llama-3.2-3B-Instruct",
+                max_tokens=512
+            )
+            
+            # Debug: Log response structure
+            print(f"   🔍 DEBUG: Response type: {type(response)}")
+            if hasattr(response, '__dict__'):
+                print(f"   🔍 DEBUG: Response attributes: {list(response.__dict__.keys())}")
+            
+            # Handle different response structures
+            if hasattr(response, 'choices') and len(response.choices) > 0:
+                if hasattr(response.choices[0], 'message'):
+                    reply = response.choices[0].message.content.strip()
+                elif hasattr(response.choices[0], 'text'):
+                    reply = response.choices[0].text.strip()
+                else:
+                    # Try dict access
+                    reply = response.choices[0].get('message', {}).get('content', '').strip() if isinstance(response.choices[0], dict) else str(response.choices[0]).strip()
+            elif isinstance(response, dict):
+                # Response is a dict
+                if 'choices' in response and len(response['choices']) > 0:
+                    choice = response['choices'][0]
+                    if isinstance(choice, dict):
+                        reply = choice.get('message', {}).get('content', '').strip()
+                    else:
+                        reply = str(choice).strip()
+                elif 'text' in response:
+                    reply = response['text'].strip()
+                else:
+                    print(f"   ⚠️  Unexpected response structure: {list(response.keys())}")
+                    reply = ""
+            else:
+                # Try to extract text directly
+                reply = str(response).strip()
+                print(f"   ⚠️  Unexpected response type, using string conversion")
+            
+            print(f"   🔍 DEBUG: Extracted reply: '{reply[:100]}...' (length: {len(reply)})")
+            
+        except Exception as api_error:
+            print(f"   ❌ Hugging Face API error: {api_error}")
+            print(f"   ❌ Error type: {type(api_error).__name__}")
+            import traceback
+            traceback.print_exc()
+            reply = ""
         
         if not reply or len(reply) < 3:
+            print(f"   ⚠️  Empty or too short reply, using fallback")
             fallbacks = {
-                "en": f"I understand you said: {text}. How can I help?",
-                "hi": f"मैं समझ गया: {text}. मैं कैसे मदद कर सकता हूं?",
-                "fr": f"Je comprends: {text}. Comment puis-je vous aider?"
+                "en": f"Hey! 👋 How's it going?",
+                "hi": f"नमस्ते! 👋 कैसे हो?",
+                "fr": f"Salut! 👋 Comment ça va?"
             }
             return fallbacks.get(language, fallbacks["en"])
         
@@ -414,9 +478,16 @@ You can use emojis occasionally to add personality, but don't overdo it. Be your
         return reply
         
     except Exception as e:
-        print(f"   ⚠️  LLM error: {e}")
+        print(f"   ❌ LLM error: {e}")
+        print(f"   ❌ Error type: {type(e).__name__}")
         traceback.print_exc()
-        return f"You said: {text}"
+        # Use friendly fallback instead of repeating user message
+        fallbacks = {
+            "en": f"Hey! 👋 Sorry, I'm having a bit of trouble right now. What's on your mind?",
+            "hi": f"नमस्ते! 👋 माफ करें, मुझे अभी थोड़ी परेशानी हो रही है। आप क्या सोच रहे हैं?",
+            "fr": f"Salut! 👋 Désolé, j'ai un petit problème en ce moment. Qu'est-ce qui te passe par la tête?"
+        }
+        return fallbacks.get(language, fallbacks["en"])
 
 
 async def text_to_speech(text: str, language: str = "en", output_file: str = None) -> str:
@@ -1793,11 +1864,13 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                 print(f"   ⚠️  Error storing AI message in group chat: {e}")
         
     except Exception as e:
-        print(f"   ⚠️  LLM error: {e}")
+        print(f"   ❌ LLM error in normal conversation: {e}")
+        print(f"   ❌ Error type: {type(e).__name__}")
+        traceback.print_exc()
         fallbacks = {
-            "en": f"You said: {text}",
-            "hi": f"आपने कहा: {text}",
-            "fr": f"Vous avez dit: {text}"
+            "en": f"Hey! 👋 I'm here! What's up?",
+            "hi": f"नमस्ते! 👋 मैं यहाँ हूँ! क्या हो रहा है?",
+            "fr": f"Salut! 👋 Je suis là! Qu'est-ce qui se passe?"
         }
         reply = fallbacks.get(detected_language, fallbacks["en"])
     
