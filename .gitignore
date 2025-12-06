@@ -18,6 +18,9 @@ ENV/
 *.m4a
 !Marquee.m4a
 
+# Dead Letter Queue
+dlq/
+
 # Output files
 output.json
 *.json

@@ -19,14 +19,22 @@ TOPIC_NAME = os.getenv('KAFKA_TOPIC_NAME')
 KAFKA_SASL_USERNAME = os.getenv('KAFKA_SASL_USERNAME')
 KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD')
 
-# Initialize Producer
+# Initialize Producer with reliability settings
+# acks='all': Wait for all in-sync replicas to acknowledge
+# enable_idempotence=True: Prevent duplicates on retries (exactly-once semantics)
+# retries: Unlimited retries with exponential backoff
 producer = KafkaProducer(
     bootstrap_servers=[BOOTSTRAP_SERVERS],
     security_protocol='SASL_SSL',
     sasl_mechanism='PLAIN',
     sasl_plain_username=KAFKA_SASL_USERNAME,
     sasl_plain_password=KAFKA_SASL_PASSWORD,
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+    acks='all',  # Wait for all in-sync replicas
+    enable_idempotence=True,  # Prevent duplicates on retries
+    retries=2147483647,  # Maximum retries (effectively unlimited)
+    max_in_flight_requests_per_connection=5  # Required for idempotence
+    # Note: compression_type removed - requires additional libraries
 )
 
 def send_test_message(text: str, event_type: str = "message.received"):

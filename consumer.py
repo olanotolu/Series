@@ -18,6 +18,7 @@ import shutil
 from datetime import datetime
 from dotenv import load_dotenv
 from opus_to_wav import opus_to_wav
+from dlq_handler import send_to_dlq, classify_error, is_recoverable_error
 
 # Hugging Face Inference API (much faster than loading models locally)
 try:
@@ -224,18 +225,35 @@ def send_text(chat_id: str, text: str):
     print(f"   Text: {text}")
     
     try:
-        r = requests.post(url, json=payload, headers=headers)
-        response = r.json()
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
         
-        if r.status_code in [200, 201]:
-            message_id = response.get('data', {}).get('id', 'N/A')
-            print(f"   ✅ Message ID: {message_id}")
-            print(f"   Status: {r.status_code} - Success")
-        else:
+        # Check status code first
+        if r.status_code not in [200, 201]:
+            # Raise HTTPError for proper error classification
+            error_msg = f"Series API returned {r.status_code}"
             print(f"   ⚠️  Status: {r.status_code}")
-            print(f"   Response: {response}")
+            try:
+                response = r.json()
+                print(f"   Response: {response}")
+            except:
+                response = r.text
+                print(f"   Response: {response}")
+            r.raise_for_status()  # Raises HTTPError for 4xx/5xx
         
+        response = r.json()
+        message_id = response.get('data', {}).get('id', 'N/A')
+        print(f"   ✅ Message ID: {message_id}")
+        print(f"   Status: {r.status_code} - Success")
         return response
+    except requests.exceptions.Timeout:
+        print(f"   ❌ Timeout sending message")
+        raise
+    except requests.exceptions.ConnectionError:
+        print(f"   ❌ Connection error sending message")
+        raise
+    except requests.exceptions.HTTPError as e:
+        print(f"   ❌ HTTP error sending: {e}")
+        raise
     except Exception as e:
         print(f"   ❌ Error sending: {e}")
         raise
@@ -467,6 +485,10 @@ print("")
 message_count = 0
 last_heartbeat = time.time()
 
+# Idempotency tracking: Store processed message IDs to prevent duplicate processing
+# Uses event_id or data.id as unique identifier
+processed_messages = set()
+
 try:
     while True:
         # Use poll() for seamless real-time message processing
@@ -490,6 +512,8 @@ try:
                 msg_partition = msg.partition
                 
                 # Wrap each message in try/except so one bad message doesn't stop processing
+                # Store event outside try block for DLQ access in exception handler
+                event = None
                 try:
                     event = msg.value
                     
@@ -498,20 +522,41 @@ try:
                     data = event.get("data", {}) if isinstance(event, dict) else {}
                     created_at = event.get("created_at", "N/A") if isinstance(event, dict) else "N/A"
                     
+                    # IDEMPOTENCY CHECK: Prevent duplicate processing
+                    event_id = event.get("event_id") or data.get("id") or f"offset_{msg_partition}_{msg_offset}"
+                    if event_id in processed_messages:
+                        print(f"\n{'='*60}")
+                        print(f"⏭️  SKIPPING DUPLICATE - Event #{message_count}")
+                        print(f"{'='*60}")
+                        print(f"📊 Kafka: Partition {msg_partition}, Offset {msg_offset}")
+                        print(f"🆔 Event ID: {event_id}")
+                        print(f"   ✅ Already processed - skipping to prevent duplicate")
+                        print(f"{'='*60}\n")
+                        # Commit offset and continue
+                        consumer.commit()
+                        continue
+                    
+                    # Mark as processing
+                    processed_messages.add(event_id)
+                    
                     print(f"\n{'='*60}")
                     print(f"📨 EVENT #{message_count} - {event_type.upper() if event_type else 'UNKNOWN'}")
                     print(f"{'='*60}")
                     print(f"⏰ Time: {created_at}")
                     print(f"📊 Kafka: Partition {msg_partition}, Offset {msg_offset}")
+                    print(f"🆔 Event ID: {event_id}")
                     print(f"🔍 Raw event keys: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
                     print(f"{'='*60}")
                     
-                    # Handle case where event_type is missing
+                    # Handle case where event_type is missing (non-recoverable)
                     if not event_type:
-                        print("⚠️  WARNING: Event missing 'event_type' field!")
+                        error_msg = "Event missing 'event_type' field"
+                        error = ValueError(error_msg)
+                        print(f"⚠️  WARNING: {error_msg}!")
                         print(f"   Full event structure: {json.dumps(event, indent=2)}")
                         print(f"{'='*60}\n")
-                        # Commit offset automatically - kafka-python tracks the last consumed offset
+                        # Send to DLQ and commit
+                        send_to_dlq(event, error, 'non_recoverable', msg_partition, msg_offset)
                         consumer.commit()
                         continue
                     
@@ -617,21 +662,40 @@ try:
                 
                 except Exception as e:
                     # Error processing this specific message
+                    error_classification = classify_error(e)
+                    is_recoverable = is_recoverable_error(e)
+                    
                     print(f"\n❌ ERROR processing message at offset {msg_offset}: {e}")
+                    print(f"   🔍 Error Type: {type(e).__name__}")
+                    print(f"   📊 Classification: {error_classification}")
                     import traceback
                     traceback.print_exc()
                     
-                    # Commit offset to skip this bad message and continue seamlessly
-                    # This prevents the consumer from getting stuck on bad messages
-                    print(f"   ⚠️  Committing offset to skip this message (may need manual review)")
-                    try:
-                        consumer.commit()
-                        print(f"   ✅ Offset {msg_offset} committed (skipping bad message)")
-                    except Exception as commit_error:
-                        print(f"   ❌ Failed to commit after error: {commit_error}")
-                        # This is bad - we might reprocess this message, but continue anyway
-                    print(f"{'='*60}\n")
-                    continue  # Continue processing next message seamlessly
+                    # Use event stored before try block (or empty dict if not available)
+                    if event is None:
+                        event = {}
+                    
+                    if is_recoverable:
+                        # RECOVERABLE ERROR: Don't commit, allow retry on restart
+                        print(f"   🔄 RECOVERABLE ERROR: Will retry on consumer restart")
+                        print(f"   ⚠️  NOT committing offset - message will be reprocessed")
+                        print(f"{'='*60}\n")
+                        # Re-raise to stop consumer (will retry on restart)
+                        raise
+                    else:
+                        # NON-RECOVERABLE ERROR: Send to DLQ and commit offset
+                        print(f"   🚫 NON-RECOVERABLE ERROR: Sending to DLQ and skipping")
+                        send_to_dlq(event, e, error_classification, msg_partition, msg_offset)
+                        
+                        # Commit offset to skip this bad message
+                        try:
+                            consumer.commit()
+                            print(f"   ✅ Offset {msg_offset} committed (message sent to DLQ)")
+                        except Exception as commit_error:
+                            print(f"   ❌ Failed to commit after error: {commit_error}")
+                            # This is bad - we might reprocess this message, but continue anyway
+                        print(f"{'='*60}\n")
+                        continue  # Continue processing next message seamlessly
 
 except KeyboardInterrupt:
     print(f"\n\n🛑 Consumer stopped")
