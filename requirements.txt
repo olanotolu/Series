@@ -1,0 +1,5 @@
+kafka-python
+requests
+python-dotenv
+pydub
+huggingface_hub

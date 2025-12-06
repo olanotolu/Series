@@ -1,0 +1,35 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Audio files (keep Marquee.m4a but ignore others)
+*.wav
+*.opus
+*.mp3
+*.m4a
+!Marquee.m4a
+
+# Output files
+output.json
+*.json
+!requirements.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
