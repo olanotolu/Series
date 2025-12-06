@@ -317,3 +317,46 @@ class SessionManager:
         except Exception as e:
             print(f"   ⚠️  Supabase get_all_completed_profiles error: {e}")
             return []
+
+    def set_pending_match(self, user_id: str, match_user_id: str):
+        """Store the matched user's ID when waiting for match confirmation."""
+        if not self.supabase:
+            return
+        
+        try:
+            data = {
+                "user_id": user_id,
+                "pending_match_user_id": match_user_id
+            }
+            self.supabase.table("sessions").upsert(data).execute()
+        except Exception as e:
+            print(f"   ⚠️  Supabase set_pending_match error: {e}")
+
+    def get_pending_match(self, user_id: str) -> str:
+        """Get the pending match user_id if one exists."""
+        if not self.supabase:
+            return None
+        
+        try:
+            response = self.supabase.table("sessions").select("pending_match_user_id").eq("user_id", user_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0].get("pending_match_user_id")
+            return None
+        except Exception as e:
+            print(f"   ⚠️  Supabase get_pending_match error: {e}")
+            return None
+
+    def clear_pending_match(self, user_id: str):
+        """Clear the pending match user_id."""
+        if not self.supabase:
+            return
+        
+        try:
+            data = {
+                "user_id": user_id,
+                "pending_match_user_id": None
+            }
+            self.supabase.table("sessions").upsert(data).execute()
+        except Exception as e:
+            print(f"   ⚠️  Supabase clear_pending_match error: {e}")

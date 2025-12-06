@@ -538,6 +538,84 @@ async def stop_typing(session: aiohttp.ClientSession, chat_id: str):
         print(f"   ⚠️  Stop typing error: {e}")
 
 
+async def create_group_chat(session: aiohttp.ClientSession, user_phone: str, match_phone: str, user_name: str, match_name: str, common_hobbies: list) -> str:
+    """
+    Create a group chat with user, match, and AI.
+    
+    Args:
+        session: aiohttp session
+        user_phone: Current user's phone number
+        match_phone: Matched user's phone number
+        user_name: Current user's name
+        match_name: Matched user's name
+        common_hobbies: List of common hobbies
+    
+    Returns:
+        Chat ID if successful, None otherwise
+    """
+    url = f"{BASE_URL}/api/chats"
+    
+    # Format display name: "User & Match"
+    display_name = f"{user_name} & {match_name}"
+    
+    # Format common hobbies for intro message
+    if common_hobbies:
+        if len(common_hobbies) == 1:
+            hobbies_str = common_hobbies[0]
+        elif len(common_hobbies) == 2:
+            hobbies_str = f"{common_hobbies[0]} and {common_hobbies[1]}"
+        else:
+            hobbies_str = ", ".join(common_hobbies[:-1]) + f", and {common_hobbies[-1]}"
+    else:
+        hobbies_str = "similar interests"
+    
+    # Create intro message
+    intro_message = f"Hey! I matched you two because you both love {hobbies_str}. Say hi!"
+    
+    # Payload for group chat creation
+    payload = {
+        "send_from": SENDER_NUMBER,
+        "chat": {
+            "display_name": display_name,
+            "phone_numbers": [user_phone, match_phone, SENDER_NUMBER]
+        },
+        "message": {
+            "text": intro_message
+        }
+    }
+    
+    print(f"\n📤 CREATING GROUP CHAT:")
+    print(f"   Display Name: {display_name}")
+    print(f"   Participants: {user_phone}, {match_phone}, {SENDER_NUMBER}")
+    print(f"   Intro Message: {intro_message}")
+    
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=30) as r:
+            if r.status not in [200, 201]:
+                error_msg = f"Series API returned {r.status}"
+                print(f"   ⚠️  Status: {r.status}")
+                try:
+                    resp_json = await r.json()
+                    print(f"   Response: {resp_json}")
+                except:
+                    resp_text = await r.text()
+                    print(f"   Response: {resp_text}")
+                return None
+            
+            response = await r.json()
+            chat_id = response.get('data', {}).get('id')
+            if chat_id:
+                print(f"   ✅ Group chat created! Chat ID: {chat_id}")
+                return str(chat_id)
+            else:
+                print(f"   ⚠️  No chat ID in response: {response}")
+                return None
+    except Exception as e:
+        print(f"   ❌ Error creating group chat: {e}")
+        traceback.print_exc()
+        return None
+
+
 async def download_file(session: aiohttp.ClientSession, url: str) -> bytes:
     """Download a file from a URL."""
     async with session.get(url, headers=headers, timeout=30) as response:
@@ -933,6 +1011,109 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             print("   ✅ Reset cancelled.")
             return
     
+    # Handle match confirmation
+    if onboarding_state == "match_confirmation":
+        # Check for "yes" variations (case-insensitive)
+        text_lower = text.strip().lower()
+        yes_variations = ["yes", "yeah", "sure", "ok", "yep", "okay", "y", "okay", "sounds good", "let's do it", "go ahead"]
+        
+        if any(text_lower == variant or text_lower.startswith(variant + " ") or text_lower.endswith(" " + variant) for variant in yes_variations):
+            # User confirmed - create group chat
+            print(f"   ✅ Match confirmed by {sender}...")
+            
+            # Get pending match info
+            match_user_id = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_pending_match, sender)
+            
+            if not match_user_id:
+                await send_text(session, chat_id, "Sorry, I couldn't find the match info. Please try again later.")
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                return
+            
+            # Get profiles for both users
+            user_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+            match_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, match_user_id)
+            
+            if not user_profile or not match_profile:
+                await send_text(session, chat_id, "Sorry, couldn't retrieve profile information. Please try again later.")
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                return
+            
+            # Get common hobbies
+            user_hobbies = user_profile.get('hobbies', '')
+            match_hobbies = match_profile.get('hobbies', '')
+            common = await loop.run_in_executor(
+                CPU_BOUND_EXECUTOR,
+                calculate_common_hobbies,
+                user_hobbies,
+                match_hobbies
+            )
+            
+            # Create group chat
+            try:
+                group_chat_id = await create_group_chat(
+                    session,
+                    sender,
+                    match_user_id,
+                    user_profile.get('name', 'User'),
+                    match_profile.get('name', 'Match'),
+                    common
+                )
+                
+                if group_chat_id:
+                    # Record match in database
+                    def record_match():
+                        from embedding_service import get_supabase_client
+                        client = get_supabase_client()
+                        if client:
+                            # Get match score from previous match
+                            try:
+                                matches = find_matches(sender, 5)  # Get more matches to find the right one
+                                match_score = 0.0
+                                if matches:
+                                    for m in matches:
+                                        if m.get('user_id') == match_user_id:
+                                            match_score = m.get('score', 0.0)
+                                            break
+                                
+                                client.table('matches').insert({
+                                    'user1_id': sender,
+                                    'user2_id': match_user_id,
+                                    'score': match_score,
+                                    'status': 'accepted'
+                                }).execute()
+                                print(f"   ✅ Match recorded in database: {sender} ↔ {match_user_id} (score: {match_score:.2%})")
+                            except Exception as e:
+                                print(f"   ⚠️  Error recording match: {e}")
+                    
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, record_match)
+                    
+                    # Clear pending match and reset state
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                    
+                    await send_text(session, chat_id, f"✅ Group chat created! Check your messages.")
+                    print(f"   ✅ Group chat created successfully: {group_chat_id}")
+                else:
+                    await send_text(session, chat_id, "Sorry, couldn't create the group chat. Please try again later.")
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            except Exception as e:
+                print(f"   ❌ Error creating group chat: {e}")
+                traceback.print_exc()
+                await send_text(session, chat_id, "Sorry, there was an error creating the group chat. Please try again later.")
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            return
+        else:
+            # User declined or said something else - cancel match confirmation
+            print(f"   ❌ Match confirmation cancelled by {sender}")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            await send_text(session, chat_id, "No problem! Let me know if you want to find another match later.")
+            # Continue to normal conversation flow
+    
     # Handle onboarding flow
     if not is_complete:
         print(f"   🎯 Entering onboarding flow (complete={is_complete}, state={onboarding_state})")
@@ -1027,7 +1208,16 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                         full_message = f"{completion_msg}\n\n{match_msg}"
                         await send_text(session, chat_id, full_message)
                         
-                        print(f"   ✅ Match found: {top_match.get('name')} (score: {match_score:.2%})")
+                        # Store match info and set state to match_confirmation
+                        match_user_id = top_match.get('user_id')
+                        if match_user_id:
+                            def store_match_info():
+                                session_manager.set_pending_match(sender, match_user_id)
+                                session_manager.set_onboarding_state(sender, "match_confirmation")
+                            await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_match_info)
+                            print(f"   ✅ Match found: {top_match.get('name')} (score: {match_score:.2%}) - waiting for confirmation")
+                        else:
+                            print(f"   ✅ Match found: {top_match.get('name')} (score: {match_score:.2%})")
                     else:
                         # No enriched matches, just send completion
                         completion_msg = get_completion_message(profile)
