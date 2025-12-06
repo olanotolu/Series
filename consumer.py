@@ -60,6 +60,14 @@ KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD')
 # Hugging Face Token
 HF_TOKEN = os.getenv('HF_TOKEN', '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')
 
+# Language Detection
+try:
+    from langdetect import detect, LangDetectException
+    LANGDETECT_AVAILABLE = True
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+    print("⚠️  langdetect not installed. Install with: pip install langdetect")
+
 # Global objects
 headers = {"Authorization": f"Bearer {API_KEY}"}
 hf_client = None
@@ -92,32 +100,27 @@ async def init_hf_client():
 
 
 async def detect_language(text: str) -> str:
-    """Detect language of text (English, Hindi, French)."""
-    global hf_client
+    """Detect language of text using langdetect (Google's algorithm)."""
     
-    if not HF_AVAILABLE or hf_client is None:
-        if not await init_hf_client():
-            return "en"  # Default to English
+    if not text or len(text.strip()) < 3:
+        return "en"
+        
+    loop = asyncio.get_event_loop()
     
-    try:
-        # Use language identification model
-        # Simple heuristic: check for common patterns
-        text_lower = text.lower().strip()
-        
-        # Hindi detection (Devanagari script)
-        if any('\u0900' <= char <= '\u097F' for char in text):
-            return "hi"
-        
-        # French detection (common French words/patterns)
-        french_indicators = ['bonjour', 'merci', 'salut', 'ça va', 'comment', 'pourquoi', 'parce que', 'très', 'beaucoup']
-        if any(indicator in text_lower for indicator in french_indicators):
-            return "fr"
-        
-        # Default to English
-        return "en"
-    except Exception as e:
-        print(f"   ⚠️  Language detection error: {e}, defaulting to English")
-        return "en"
+    def _detect_safe():
+        if not LANGDETECT_AVAILABLE:
+            return "en"
+        try:
+            return detect(text)
+        except LangDetectException:
+            return "en"
+        except Exception as e:
+            print(f"   ⚠️  Language detection error: {e}")
+            return "en"
+
+    # Run CPU-bound detection in thread pool
+    lang = await loop.run_in_executor(CPU_BOUND_EXECUTOR, _detect_safe)
+    return lang
 
 
 async def transcribe_audio(filename: str, language: str = None) -> tuple:
@@ -366,28 +369,34 @@ async def send_audio(session: aiohttp.ClientSession, chat_id: str, audio_file_pa
     
     audio_base64 = await loop.run_in_executor(CPU_BOUND_EXECUTOR, read_and_encode)
     
-    # Determine format from file extension
-    if audio_file_path.endswith('.opus'):
-        format_type = 'opus'
+    # Determine format - M4A is the target for voice memos
+    filename = os.path.basename(audio_file_path)
+    if audio_file_path.endswith('.m4a'):
+        mime_type = 'audio/m4a'
+    elif audio_file_path.endswith('.opus'):
+        mime_type = 'audio/ogg' # Opus usually sent as OGG container
     elif audio_file_path.endswith('.wav'):
-        format_type = 'wav'
+        mime_type = 'audio/wav'
     else:
-        format_type = 'opus'  # default
+        mime_type = 'application/octet-stream'
     
+    # Payload Structure for Voice Memo (M4A)
     payload = {
         "message": {
-            "audio": {
-                "format": format_type,
-                "sample_rate": 16000,
-                "channels": 1,
-                "data": audio_base64
-            }
+            "text": "",
+            "attachments": [
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "data_base64": audio_base64
+                }
+            ]
         }
     }
     
-    print(f"\n📤 OUTGOING VOICE MEMO:")
+    print(f"\n📤 OUTGOING VOICE MEMO ({mime_type}):")
     print(f"   Chat ID: {chat_id}")
-    print(f"   Audio file: {audio_file_path}")
+    print(f"   File: {filename}")
     
     try:
         async with session.post(url, json=payload, headers=headers, timeout=30) as r:
@@ -447,32 +456,33 @@ async def download_file(session: aiohttp.ClientSession, url: str) -> bytes:
             raise Exception(f"Failed to download: {response.status}")
 
 
-def wav_to_opus(wav_file: str, opus_file: str = None) -> str:
-    """Convert WAV file to OPUS format using ffmpeg."""
-    if opus_file is None:
-        opus_file = wav_file.replace('.wav', '.opus')
+def wav_to_m4a(wav_file: str, m4a_file: str = None) -> str:
+    """Convert WAV file to M4A (AAC) format using ffmpeg."""
+    if m4a_file is None:
+        m4a_file = wav_file.replace('.wav', '.m4a')
     
     try:
         import subprocess
+        # ffmpeg -y -i input.wav -c:a aac -b:a 48k output.m4a
         result = subprocess.run([
-            'ffmpeg', '-y', '-i', wav_file,
-            '-ar', '16000',  # Sample rate
-            '-ac', '1',      # Mono
-            '-b:a', '32k',   # Bitrate
-            opus_file
+            'ffmpeg', '-y', 
+            '-i', wav_file,
+            '-c:a', 'aac', 
+            '-b:a', '48k',
+            m4a_file
         ], check=True, capture_output=True)
         
-        if os.path.exists(opus_file):
-            print(f"   ✅ Converted WAV → OPUS: {opus_file}")
-            return opus_file
+        if os.path.exists(m4a_file):
+            print(f"   ✅ Converted WAV → M4A: {m4a_file}")
+            return m4a_file
         else:
-            print(f"   ⚠️  OPUS file not created")
+            print(f"   ⚠️  M4A file not created")
             return None
     except subprocess.CalledProcessError as e:
-        print(f"   ⚠️  Error converting to OPUS: {e.stderr.decode() if e.stderr else str(e)}")
+        print(f"   ⚠️  Error converting to M4A: {e.stderr.decode() if e.stderr else str(e)}")
         return None
     except Exception as e:
-        print(f"   ⚠️  Error converting to OPUS: {e}")
+        print(f"   ⚠️  Error converting to M4A: {e}")
         return None
 
 
@@ -560,24 +570,24 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
                 if tts_wav and os.path.exists(tts_wav):
                     print(f"   ✅ STEP 7 COMPLETE: TTS WAV saved: {tts_wav}")
                     
-                    # Convert WAV to OPUS for efficient transmission
-                    print(f"   🎵 STEP 8: Converting TTS WAV → OPUS...")
+                    # Convert WAV to M4A (AAC) for iMessage voice memo
+                    print(f"   🎵 STEP 8: Converting TTS WAV → M4A (AAC)...")
                     loop = asyncio.get_event_loop()
-                    opus_file = await loop.run_in_executor(
+                    m4a_file = await loop.run_in_executor(
                         CPU_BOUND_EXECUTOR, 
-                        wav_to_opus, 
+                        wav_to_m4a, 
                         tts_wav
                     )
                     
-                    if opus_file and os.path.exists(opus_file):
-                        print(f"   ✅ STEP 8 COMPLETE: OPUS file ready: {opus_file}")
+                    if m4a_file and os.path.exists(m4a_file):
+                        print(f"   ✅ STEP 8 COMPLETE: M4A file ready: {m4a_file}")
                         # Send voice response
                         print(f"   📤 STEP 9: Sending voice response to phone...")
-                        await send_audio(session, chat_id, opus_file)
+                        await send_audio(session, chat_id, m4a_file)
                         print(f"   ✅ STEP 9 COMPLETE: Voice response sent!")
                     else:
-                        # Fallback to text if OPUS conversion fails
-                        print(f"   ⚠️  OPUS conversion failed, sending text instead")
+                        # Fallback to text if M4A conversion fails
+                        print(f"   ⚠️  M4A conversion failed, sending text instead")
                         await send_text(session, chat_id, llm_reply)
                 else:
                     # Fallback to text if TTS fails

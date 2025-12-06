@@ -3,3 +3,4 @@ requests
 python-dotenv
 pydub
 huggingface_hub
+langdetect
