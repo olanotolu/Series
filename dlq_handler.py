@@ -16,13 +16,16 @@ DLQ_DIR = "dlq"
 
 
 def ensure_dlq_directory():
-    """Ensure the DLQ directory exists."""
-    os.makedirs(DLQ_DIR, exist_ok=True)
+    """Ensure the DLQ directory exists with date-based subdirectories."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    date_dir = os.path.join(DLQ_DIR, today)
+    os.makedirs(date_dir, exist_ok=True)
+    return date_dir
 
 
-def send_to_dlq(event: dict, error: Exception, error_type: str, partition: int = None, offset: int = None):
+def send_to_dlq(event: dict, error: Exception, error_type: str, partition: int = None, offset: int = None, topic: str = None):
     """
-    Send a failed message to the Dead Letter Queue.
+    Send a failed message to the Dead Letter Queue with production-grade structure.
     
     Args:
         event: The original Kafka event/message
@@ -30,36 +33,43 @@ def send_to_dlq(event: dict, error: Exception, error_type: str, partition: int =
         error_type: Classification ('recoverable' or 'non_recoverable')
         partition: Kafka partition number (optional)
         offset: Kafka offset number (optional)
+        topic: Kafka topic name (optional)
     
     Returns:
         str: Path to the DLQ file
     """
-    ensure_dlq_directory()
+    date_dir = ensure_dlq_directory()
     
     # Extract event_id for filename
     event_id = event.get('event_id', 'unknown')
     if not event_id or event_id == 'unknown':
-        # Fallback to timestamp if no event_id
-        event_id = f"no_id_{int(datetime.now().timestamp())}"
+        # Fallback to offset-based ID if no event_id
+        event_id = f"offset_{partition}_{offset}" if partition is not None and offset is not None else f"no_id_{int(datetime.now().timestamp())}"
     
-    # Create filename with event_id and timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # Create filename with event_id and offset
     safe_event_id = str(event_id).replace('/', '_').replace('\\', '_')[:50]  # Sanitize
-    filename = f"{safe_event_id}_{timestamp}.json"
-    filepath = os.path.join(DLQ_DIR, filename)
+    offset_str = f"_{offset}" if offset is not None else ""
+    filename = f"{safe_event_id}{offset_str}.json"
+    filepath = os.path.join(date_dir, filename)
     
-    # Prepare DLQ entry
+    # Prepare production-grade DLQ entry
     dlq_entry = {
-        "dlq_metadata": {
-            "timestamp": datetime.now().isoformat(),
-            "error_type": error_type,
-            "error_class": type(error).__name__,
-            "error_message": str(error),
+        "event": event,
+        "kafka": {
             "partition": partition,
             "offset": offset,
-            "stack_trace": traceback.format_exc()
+            "topic": topic
         },
-        "original_event": event
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            "stack": traceback.format_exc()
+        },
+        "dlq_metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "error_classification": error_type,
+            "dlq_version": "1.0"
+        }
     }
     
     # Write to file

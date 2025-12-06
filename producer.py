@@ -33,7 +33,7 @@ producer = KafkaProducer(
     acks='all',  # Wait for all in-sync replicas
     enable_idempotence=True,  # Prevent duplicates on retries
     retries=2147483647,  # Maximum retries (effectively unlimited)
-    max_in_flight_requests_per_connection=5  # Required for idempotence
+    max_in_flight_requests_per_connection=1  # Must be 1 for idempotence guarantee
     # Note: compression_type removed - requires additional libraries
 )
 

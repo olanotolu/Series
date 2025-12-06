@@ -9,12 +9,14 @@ Listens to Kafka events and handles:
 """
 
 from kafka import KafkaConsumer
+from kafka.structs import TopicPartition
 import json
 import requests
 import time
 import os
 import base64
 import shutil
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 from opus_to_wav import opus_to_wav
@@ -487,7 +489,11 @@ last_heartbeat = time.time()
 
 # Idempotency tracking: Store processed message IDs to prevent duplicate processing
 # Uses event_id or data.id as unique identifier
+# Note: In production, use Redis with TTL for distributed idempotency
 processed_messages = set()
+
+# Retry tracking for exponential backoff (per partition)
+retry_counts = {}  # {partition: retry_count}
 
 try:
     while True:
@@ -555,8 +561,8 @@ try:
                         print(f"⚠️  WARNING: {error_msg}!")
                         print(f"   Full event structure: {json.dumps(event, indent=2)}")
                         print(f"{'='*60}\n")
-                        # Send to DLQ and commit
-                        send_to_dlq(event, error, 'non_recoverable', msg_partition, msg_offset)
+                        # Send to DLQ FIRST, then commit (ensures no message loss)
+                        send_to_dlq(event, error, 'non_recoverable', msg_partition, msg_offset, topic_partition.topic)
                         consumer.commit()
                         continue
                     
@@ -676,24 +682,58 @@ try:
                         event = {}
                     
                     if is_recoverable:
-                        # RECOVERABLE ERROR: Don't commit, allow retry on restart
-                        print(f"   🔄 RECOVERABLE ERROR: Will retry on consumer restart")
-                        print(f"   ⚠️  NOT committing offset - message will be reprocessed")
-                        print(f"{'='*60}\n")
-                        # Re-raise to stop consumer (will retry on restart)
-                        raise
-                    else:
-                        # NON-RECOVERABLE ERROR: Send to DLQ and commit offset
-                        print(f"   🚫 NON-RECOVERABLE ERROR: Sending to DLQ and skipping")
-                        send_to_dlq(event, e, error_classification, msg_partition, msg_offset)
+                        # RECOVERABLE ERROR: Pause partition, exponential backoff, then retry
+                        tp = TopicPartition(topic_partition.topic, msg_partition)
                         
-                        # Commit offset to skip this bad message
-                        try:
-                            consumer.commit()
-                            print(f"   ✅ Offset {msg_offset} committed (message sent to DLQ)")
-                        except Exception as commit_error:
-                            print(f"   ❌ Failed to commit after error: {commit_error}")
-                            # This is bad - we might reprocess this message, but continue anyway
+                        # Track retry count for exponential backoff
+                        retry_key = msg_partition
+                        retry_count = retry_counts.get(retry_key, 0)
+                        retry_counts[retry_key] = retry_count + 1
+                        
+                        # Exponential backoff: 2^retry_count seconds (max 60s)
+                        backoff_seconds = min(2 ** retry_count, 60)
+                        # Add jitter to prevent thundering herd
+                        jitter = random.uniform(0, 0.3 * backoff_seconds)
+                        total_backoff = backoff_seconds + jitter
+                        
+                        print(f"   🔄 RECOVERABLE ERROR: Pausing partition {msg_partition}")
+                        print(f"   ⏳ Backoff: {total_backoff:.2f}s (attempt {retry_count + 1})")
+                        print(f"   ⚠️  NOT committing offset - will retry after backoff")
+                        
+                        # Pause this partition to prevent processing more messages
+                        consumer.pause([tp])
+                        
+                        # Wait with exponential backoff
+                        time.sleep(total_backoff)
+                        
+                        # Resume partition
+                        consumer.resume([tp])
+                        print(f"   ✅ Partition {msg_partition} resumed - retrying message")
+                        print(f"{'='*60}\n")
+                        
+                        # Don't commit - allow retry of this message
+                        # Continue to next iteration to retry
+                        continue
+                    else:
+                        # NON-RECOVERABLE ERROR: Send to DLQ FIRST, then commit offset
+                        print(f"   🚫 NON-RECOVERABLE ERROR: Sending to DLQ and skipping")
+                        
+                        # CRITICAL: Write to DLQ BEFORE committing (ensures no message loss)
+                        dlq_path = send_to_dlq(event, e, error_classification, msg_partition, msg_offset, topic_partition.topic)
+                        
+                        if dlq_path:
+                            # Only commit if DLQ write succeeded
+                            try:
+                                consumer.commit()
+                                print(f"   ✅ Offset {msg_offset} committed (message saved to DLQ)")
+                                # Reset retry count for this partition on success
+                                retry_counts.pop(msg_partition, None)
+                            except Exception as commit_error:
+                                print(f"   ❌ Failed to commit after error: {commit_error}")
+                                # This is bad - we might reprocess this message, but continue anyway
+                        else:
+                            print(f"   ⚠️  DLQ write failed - NOT committing offset to prevent message loss")
+                        
                         print(f"{'='*60}\n")
                         continue  # Continue processing next message seamlessly
 
