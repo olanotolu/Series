@@ -1497,6 +1497,83 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
         print("   ✅ Reset confirmation prompt sent.")
         return
     
+    # /retry command - retry matching to find a new match
+    if text.strip().lower() == "/retry":
+        print(f"   🔄 /retry command received for {sender}...")
+        await start_typing(session, chat_id)
+        
+        # Get previous match ID before clearing it
+        previous_match_id = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_pending_match, sender)
+        
+        # Clear previous match
+        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+        
+        # Get user profile
+        profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+        
+        if profile:
+            # Find new matches (exclude previous match if possible)
+            print(f"   🔍 Finding new matches...")
+            matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, find_matches, sender, 5)  # Get top 5 to find a different one
+            
+            if matches:
+                # Get enriched match data
+                enriched_matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_match_profiles, matches)
+                
+                if enriched_matches:
+                    # Find first match that's different from previous
+                    top_match = None
+                    for match in enriched_matches:
+                        if match.get('user_id') != previous_match_id:
+                            top_match = match
+                            break
+                    
+                    # If all matches are the same, just use the first one
+                    if not top_match:
+                        top_match = enriched_matches[0]
+                    
+                    match_score = top_match.get('score', 0.0)
+                    
+                    # Calculate common hobbies
+                    current_hobbies = profile.get('hobbies', '')
+                    matched_hobbies = top_match.get('hobbies', '')
+                    common = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        calculate_common_hobbies,
+                        current_hobbies,
+                        matched_hobbies
+                    )
+                    
+                    # Format match message
+                    match_msg = format_match_message(top_match, match_score, common)
+                    
+                    # Send new match message
+                    await send_text(session, chat_id, f"🔍 Found you a new match!\n\n{match_msg}")
+                    
+                    # Store new match info and set state to match_confirmation
+                    match_user_id = top_match.get('user_id')
+                    if match_user_id:
+                        def store_match_info():
+                            session_manager.set_pending_match(sender, match_user_id)
+                            session_manager.set_onboarding_state(sender, "match_confirmation")
+                        await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_match_info)
+                        print(f"   ✅ New match found: {top_match.get('name')} (score: {match_score:.2%}) - waiting for confirmation")
+                    else:
+                        print(f"   ✅ New match found: {top_match.get('name')} (score: {match_score:.2%})")
+                else:
+                    await send_text(session, chat_id, "Sorry, I couldn't find any other matches right now. Try again later!")
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            else:
+                await send_text(session, chat_id, "Sorry, I couldn't find any other matches right now. Try again later!")
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+        else:
+            await send_text(session, chat_id, "Sorry, couldn't retrieve your profile. Please complete onboarding first.")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+        
+        await stop_typing(session, chat_id)
+        print("   ✅ Retry matching complete.")
+        return
+    
     # /update command - post or view updates
     if text.strip().lower().startswith("/update"):
         print(f"   📢 /update command received for {sender}...")
@@ -1583,6 +1660,90 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
             await send_text(session, chat_id, "✅ Reset cancelled. Your data is safe!")
             print("   ✅ Reset cancelled.")
+            return
+    
+    # Handle match retry - user wants to find a different match
+    if onboarding_state == "match_retry":
+        text_lower = text.strip().lower()
+        retry_variations = ["retry matching", "retry match", "find another match", "new match", "different match", "try again", "yes", "yeah", "yea", "sure", "ok", "yep", "okay", "y"]
+        
+        if any(variant in text_lower for variant in retry_variations):
+            print(f"   🔄 Retry matching requested by {sender}...")
+            await start_typing(session, chat_id)
+            
+            # Get previous match ID before clearing it
+            previous_match_id = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_pending_match, sender)
+            
+            # Clear previous match
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+            
+            # Get user profile
+            profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+            
+            if profile:
+                # Find new matches (exclude previous match if possible)
+                print(f"   🔍 Finding new matches...")
+                matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, find_matches, sender, 5)  # Get top 5 to find a different one
+                
+                if matches:
+                    # Get enriched match data
+                    enriched_matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_match_profiles, matches)
+                    
+                    if enriched_matches:
+                        # Find first match that's different from previous
+                        top_match = None
+                        for match in enriched_matches:
+                            if match.get('user_id') != previous_match_id:
+                                top_match = match
+                                break
+                        
+                        # If all matches are the same, just use the first one
+                        if not top_match:
+                            top_match = enriched_matches[0]
+                        
+                        match_score = top_match.get('score', 0.0)
+                        
+                        # Calculate common hobbies
+                        current_hobbies = profile.get('hobbies', '')
+                        matched_hobbies = top_match.get('hobbies', '')
+                        common = await loop.run_in_executor(
+                            CPU_BOUND_EXECUTOR,
+                            calculate_common_hobbies,
+                            current_hobbies,
+                            matched_hobbies
+                        )
+                        
+                        # Format match message
+                        match_msg = format_match_message(top_match, match_score, common)
+                        
+                        # Send new match message
+                        await send_text(session, chat_id, f"🔍 Found you a new match!\n\n{match_msg}")
+                        
+                        # Store new match info and set state to match_confirmation
+                        match_user_id = top_match.get('user_id')
+                        if match_user_id:
+                            def store_match_info():
+                                session_manager.set_pending_match(sender, match_user_id)
+                                session_manager.set_onboarding_state(sender, "match_confirmation")
+                            await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_match_info)
+                            print(f"   ✅ New match found: {top_match.get('name')} (score: {match_score:.2%}) - waiting for confirmation")
+                        else:
+                            print(f"   ✅ New match found: {top_match.get('name')} (score: {match_score:.2%})")
+                    else:
+                        await send_text(session, chat_id, "Sorry, I couldn't find any other matches right now. Try again later!")
+                        await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                else:
+                    await send_text(session, chat_id, "Sorry, I couldn't find any other matches right now. Try again later!")
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            else:
+                await send_text(session, chat_id, "Sorry, couldn't retrieve your profile. Please try again later.")
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+            
+            await stop_typing(session, chat_id)
+            return
+        else:
+            # User didn't confirm retry - ask again
+            await send_text(session, chat_id, "Would you like me to find you a different match? Reply 'retry matching' or 'yes' to find a new match, or 'no' to cancel.")
             return
     
     # Handle match confirmation - keep asking until user says yes
@@ -1684,15 +1845,17 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                     await send_text(session, chat_id, f"✅ Group chat created! Check your messages.")
                     print(f"   ✅ Group chat created successfully: {group_chat_id}")
                 else:
-                    await send_text(session, chat_id, "Sorry, couldn't create the group chat. Please try again later.")
-                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
-                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                    # Group chat creation failed - offer retry matching
+                    await send_text(session, chat_id, "Sorry, couldn't create the group chat. Would you like me to find you a different match? Reply 'retry matching' or 'yes' to find a new match.")
+                    # Keep match info and set state to allow retry
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "match_retry")
             except Exception as e:
                 print(f"   ❌ Error creating group chat: {e}")
                 traceback.print_exc()
-                await send_text(session, chat_id, "Sorry, there was an error creating the group chat. Please try again later.")
-                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
-                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
+                # Group chat creation failed - offer retry matching
+                await send_text(session, chat_id, "Sorry, there was an error creating the group chat. Would you like me to find you a different match? Reply 'retry matching' or 'yes' to find a new match.")
+                # Keep match info and set state to allow retry
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "match_retry")
             return
         else:
             # User said something other than yes - keep asking for confirmation
