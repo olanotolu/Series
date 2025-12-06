@@ -1490,11 +1490,11 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             print("   ✅ Reset cancelled.")
             return
     
-    # Handle match confirmation
+    # Handle match confirmation - keep asking until user says yes
     if onboarding_state == "match_confirmation":
         # Check for "yes" variations (case-insensitive)
         text_lower = text.strip().lower()
-        yes_variations = ["yes", "yeah", "yea", "sure", "ok", "yep", "okay", "y", "sounds good", "let's do it", "go ahead"]
+        yes_variations = ["yes", "yeah", "yea", "sure", "ok", "yep", "okay", "y", "sounds good", "let's do it", "go ahead", "let's go", "sounds great"]
         
         if any(text_lower == variant or text_lower.startswith(variant + " ") or text_lower.endswith(" " + variant) for variant in yes_variations):
             # User confirmed - create group chat
@@ -1600,12 +1600,48 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                 await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
             return
         else:
-            # User declined or said something else - cancel match confirmation
-            print(f"   ❌ Match confirmation cancelled by {sender}")
-            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
-            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, None)
-            await send_text(session, chat_id, "No problem! Let me know if you want to find another match later.")
-            # Continue to normal conversation flow
+            # User said something other than yes - keep asking for confirmation
+            print(f"   ⚠️  User response not 'yes': '{text}' - re-asking for match confirmation")
+            
+            # Get match info to re-display
+            match_user_id = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_pending_match, sender)
+            
+            if match_user_id:
+                # Get match profile to re-display
+                match_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, match_user_id)
+                user_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+                
+                if match_profile and user_profile:
+                    # Re-format match message
+                    matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, find_matches, sender, 5)
+                    match_score = 0.0
+                    for m in matches:
+                        if m.get('user_id') == match_user_id:
+                            match_score = m.get('score', 0.0)
+                            break
+                    
+                    user_hobbies = user_profile.get('hobbies', '')
+                    match_hobbies = match_profile.get('hobbies', '')
+                    common = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        calculate_common_hobbies,
+                        user_hobbies,
+                        match_hobbies
+                    )
+                    
+                    match_msg = format_match_message(match_profile, match_score, common)
+                    
+                    # Re-ask for confirmation
+                    await send_text(session, chat_id, f"{match_msg}\n\nWould you like to start chatting? Reply YES to confirm.")
+                else:
+                    await send_text(session, chat_id, "I found someone for you! Would you like to start chatting? Reply YES to confirm.")
+            else:
+                # Match info lost, re-ask
+                await send_text(session, chat_id, "Would you like to start chatting with your match? Reply YES to confirm.")
+            
+            # Keep state as match_confirmation to continue asking
+            print(f"   ✅ Re-asked for match confirmation - state remains 'match_confirmation'")
+            return
     
     # Handle onboarding flow
     if not is_complete:
