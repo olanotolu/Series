@@ -2574,6 +2574,15 @@ async def consume():
             await consumer.stop()
 
 if __name__ == "__main__":
+    # Start health check HTTP server for Shipyard routing
+    try:
+        from health_server import start_health_server
+        health_port = int(os.getenv('HEALTH_PORT', '8080'))
+        start_health_server(health_port)
+    except Exception as e:
+        print(f"⚠️  Could not start health server: {e}")
+        # Continue anyway - health server is optional
+    
     try:
         asyncio.run(consume())
     except KeyboardInterrupt:
