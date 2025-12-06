@@ -312,8 +312,9 @@ async def send_text(session: aiohttp.ClientSession, chat_id: str, text: str):
         raise
 
 
-async def send_audio(session: aiohttp.ClientSession, chat_id: str, audio_file_path: str):
-    """Send an audio message (voice memo) via Series API."""
+async def send_audio(session: aiohttp.ClientSession, chat_id: str, audio_file_path: str, text: str = "🎤 Voice message"):
+    """Send an audio message (voice memo) via Series API.
+    The text parameter is required by the API and will be displayed alongside the audio."""
     url = f"{BASE_URL}/api/chats/{chat_id}/chat_messages"
     
     # Read audio file and encode to base64 (run in executor)
@@ -338,9 +339,10 @@ async def send_audio(session: aiohttp.ClientSession, chat_id: str, audio_file_pa
         mime_type = 'application/octet-stream'
     
     # Payload Structure for Voice Memo (M4A)
+    # Text is required by API (cannot be empty string)
     payload = {
         "message": {
-            "text": "",
+            "text": text,  # Required field - shows transcript/response text
             "attachments": [
                 {
                     "filename": filename,
@@ -538,9 +540,9 @@ async def process_audio_message(session: aiohttp.ClientSession, event_data: dict
                     
                     if m4a_file and os.path.exists(m4a_file):
                         print(f"   ✅ STEP 8 COMPLETE: M4A file ready: {m4a_file}")
-                        # Send voice response
+                        # Send voice response (with text transcript for API requirement)
                         print(f"   📤 STEP 9: Sending voice response to phone...")
-                        await send_audio(session, chat_id, m4a_file)
+                        await send_audio(session, chat_id, m4a_file, text=llm_reply)
                         print(f"   ✅ STEP 9 COMPLETE: Voice response sent!")
                     else:
                         # Fallback to text if M4A conversion fails
