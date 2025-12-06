@@ -37,7 +37,7 @@ producer = KafkaProducer(
     # Note: compression_type removed - requires additional libraries
 )
 
-def send_test_message(text: str, event_type: str = "message.received"):
+def send_test_message(text: str = None, audio_file: str = None, event_type: str = "message.received"):
     """Send a test message to Kafka."""
     message = {
         "api_version": "v2",
@@ -45,7 +45,7 @@ def send_test_message(text: str, event_type: str = "message.received"):
         "event_type": event_type,
         "data": {
             "chat_id": "1702918",  # Use your actual chat ID
-            "text": text,
+            "text": text or "",
             "from_phone": "+13474591567",
             "id": f"test_{datetime.now().timestamp()}",
             "is_read": False,
@@ -55,6 +55,27 @@ def send_test_message(text: str, event_type: str = "message.received"):
         },
         "event_id": f"test-{datetime.now().timestamp()}"
     }
+
+    if audio_file and os.path.exists(audio_file):
+        import base64
+        with open(audio_file, 'rb') as f:
+            audio_data = f.read()
+        
+        # Simple detection
+        fmt = "opus" if audio_file.endswith(".opus") else "wav"
+        
+        # If it's a WAV, we should convert to OPUS for realism, but for test we can send check consumer logic
+        # Consumer checks: data.audio or attachments.
+        # Let's attach as base64
+        b64_data = base64.b64encode(audio_data).decode('ascii')
+        
+        message["data"]["message"] = {
+            "audio": {
+                "format": fmt,
+                "data": b64_data
+            }
+        }
+        print(f"   📎 Added audio: {audio_file} ({len(audio_data)} bytes)")
     
     try:
         future = producer.send(TOPIC_NAME, value=message)
@@ -63,7 +84,7 @@ def send_test_message(text: str, event_type: str = "message.received"):
         print(f"   Topic: {record_metadata.topic}")
         print(f"   Partition: {record_metadata.partition}")
         print(f"   Offset: {record_metadata.offset}")
-        print(f"   Message: {text}")
+        if text: print(f"   Message: {text}")
         return True
     except Exception as e:
         print(f"❌ Error sending message: {e}")
@@ -87,16 +108,20 @@ if __name__ == '__main__':
     import sys
     
     if len(sys.argv) > 1:
-        # Send single message from command line
-        message = " ".join(sys.argv[1:])
-        send_test_message(message)
+        # Check if it's an audio file
+        arg = sys.argv[1]
+        if arg.endswith(('.opus', '.wav', '.m4a')):
+            print(f"🎤 Sending audio test: {arg}")
+            send_test_message(audio_file=arg)
+        else:
+            # Send single message from command line
+            message = " ".join(sys.argv[1:])
+            send_test_message(text=message)
     else:
         # Send multiple test messages
         test_messages = [
             "Hello! This is message 1",
-            "This is message 2",
-            "And this is message 3",
-            "Final message number 4"
+            "This is message 2"
         ]
         send_multiple_messages(test_messages)
     
