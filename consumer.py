@@ -255,6 +255,10 @@ Use this information to personalize your responses. Reference their name, school
             participants = group_context.get("participants", [])
             recent_messages = group_context.get("recent_messages", [])
             display_name = group_context.get("display_name", "Group Chat")
+            engagement_insights = group_context.get("engagement_insights", {})
+            recent_topics = group_context.get("recent_topics", [])
+            health_metrics = group_context.get("health_metrics", {})
+            common_hobbies = group_context.get("common_hobbies", [])
             
             participant_info = []
             for p in participants:
@@ -268,11 +272,61 @@ Use this information to personalize your responses. Reference their name, school
                 if parts:
                     participant_info.append(" ".join(parts))
             
+            # Build engagement awareness section
+            engagement_section = ""
+            if engagement_insights:
+                active = engagement_insights.get("active_participants", [])
+                quiet = engagement_insights.get("quiet_participants", [])
+                is_balanced = engagement_insights.get("is_balanced", True)
+                needs_engagement = engagement_insights.get("needs_engagement", False)
+                
+                engagement_section = "\nENGAGEMENT AWARENESS:\n"
+                if active:
+                    active_names = [p.get("name", "Someone") for p in active if p.get("name")]
+                    if active_names:
+                        engagement_section += f"- Active participants: {', '.join(active_names[:3])}\n"
+                if quiet and needs_engagement:
+                    quiet_names = [p.get("name", "Someone") for p in quiet if p.get("name")]
+                    if quiet_names:
+                        engagement_section += f"- Quiet participants (needs engagement): {', '.join(quiet_names[:3])}\n"
+                        engagement_section += "  → Proactively ask them questions or reference their interests to include them.\n"
+                if not is_balanced:
+                    engagement_section += "- Participation is unbalanced. Try to get everyone involved equally.\n"
+            
+            # Build topics section
+            topics_section = ""
+            if recent_topics:
+                topics_section = f"\nRECENT TOPICS DISCUSSED:\n"
+                topics_section += f"- {', '.join(recent_topics[:5])}\n"
+                topics_section += "→ Reference these topics naturally to maintain conversation continuity.\n"
+            
+            # Build health/sentiment section
+            health_section = ""
+            if health_metrics:
+                health_score = health_metrics.get("health_score", 0.5)
+                avg_boring = health_metrics.get("avg_boring_score", 5.0)
+                
+                health_section = "\nCONVERSATION HEALTH:\n"
+                if health_score < 0.4:
+                    health_section += "- Conversation health is low. Be more engaging and proactive.\n"
+                if avg_boring >= 4.0:
+                    health_section += "- Conversation has been a bit dry. Suggest interesting topics or ask engaging questions.\n"
+            
+            # Build common interests section
+            interests_section = ""
+            if common_hobbies:
+                interests_section = f"\nCOMMON INTERESTS:\n"
+                interests_section += f"- {', '.join(common_hobbies[:5])}\n"
+                interests_section += "→ Use these shared interests to facilitate conversation and find common ground.\n"
+            
             group_section = f"""
 GROUP CHAT CONTEXT:
 You are in a group chat called "{display_name}" with {len(participants)} other people.
 Participants: {', '.join(participant_info) if participant_info else 'Multiple users'}
-
+{interests_section}
+{engagement_section}
+{topics_section}
+{health_section}
 IMPORTANT GROUP CHAT RULES:
 1. You matched these people because they share common interests. Help facilitate conversation between them.
 2. Keep your responses brief and engaging - you're part of a group conversation, not a one-on-one.
@@ -280,6 +334,10 @@ IMPORTANT GROUP CHAT RULES:
 4. Encourage interaction between the participants. Ask questions that involve everyone.
 5. Be friendly and inclusive. Make sure everyone feels included in the conversation.
 6. If someone asks a question, you can answer, but also try to get others involved.
+7. If someone is quiet, proactively engage them with questions related to their interests.
+8. Maintain topic continuity by referencing recent topics naturally.
+9. If conversation feels dry, suggest new topics or ask engaging questions.
+10. Balance participation - make sure everyone has a chance to contribute.
 
 Recent conversation context:
 """
@@ -1081,16 +1139,68 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             
             # Store message in group chat history
             if message_id:
+                # Get user_id from sender phone
+                user_id = None
+                try:
+                    profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+                    if profile:
+                        user_id = profile.get('user_id') or sender
+                except:
+                    user_id = sender
+                
                 await loop.run_in_executor(
                     CPU_BOUND_EXECUTOR,
                     store_group_chat_message,
                     group_chat_info.get('id'),
                     message_id,
                     sender,
-                    None,  # user_id will be looked up if needed
+                    user_id,
                     text,
                     False  # is_from_ai
                 )
+                
+                # Analyze message: sentiment, topics, boring score, engagement
+                try:
+                    from group_chat_intelligence import analyze_message
+                    analysis = await analyze_message(
+                        group_chat_info.get('id'),
+                        message_id,
+                        text,
+                        user_id,
+                        sender
+                    )
+                    print(f"   📊 Message analysis: sentiment={analysis.get('sentiment_score', 0):.2f}, boring={analysis.get('boring_score', 5):.1f}, health={analysis.get('health_score', 0.5):.2f}")
+                    
+                    # Check if replacement should be offered (boring score >= 4)
+                    avg_boring = analysis.get('avg_boring_score', 5.0)
+                    print(f"   📊 Average boring score: {avg_boring:.1f} (threshold: 4.0)")
+                    if avg_boring >= 4.0:
+                        print(f"   ⚠️  Boring score {avg_boring:.1f} >= 4.0 - checking for replacement offers...")
+                        try:
+                            from match_replacement import check_and_offer_replacements
+                            offers = await check_and_offer_replacements(group_chat_info.get('id'))
+                            print(f"   💬 Found {len(offers)} replacement offer(s)")
+                            for offer in offers:
+                                if offer.get('phone_number') and offer.get('message'):
+                                    # Send private message to user offering replacement
+                                    # Note: This would need to be sent to the user's direct chat, not group chat
+                                    print(f"   💬 Replacement offer ready for {offer.get('phone_number')}: {offer.get('message')[:50]}...")
+                        except Exception as e:
+                            print(f"   ⚠️  Error checking replacement offers: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # Check if topic suggestion should be sent
+                    from topic_suggester import should_suggest_topic, get_contextual_suggestion
+                    if should_suggest_topic(group_chat_info.get('id')):
+                        suggestion = await get_contextual_suggestion(group_chat_info.get('id'))
+                        if suggestion:
+                            print(f"   💡 Topic suggestion ready: {suggestion}")
+                            # Could send this as a proactive message
+                except Exception as e:
+                    print(f"   ⚠️  Error analyzing message: {e}")
+                    import traceback
+                    traceback.print_exc()
         elif is_group_chat and not group_chat_info:
             # Group chat exists but not in DB - create record for tracking
             print(f"   📝 Group chat not in DB, creating record...")
@@ -1179,6 +1289,73 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
         # Set state to reset_confirmation
         await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.set_onboarding_state, sender, "reset_confirmation")
         print("   ✅ Reset confirmation prompt sent.")
+        return
+    
+    # /update command - post or view updates
+    if text.strip().lower().startswith("/update"):
+        print(f"   📢 /update command received for {sender}...")
+        
+        # Extract update text (everything after "/update")
+        update_text = text[7:].strip()  # Remove "/update" prefix
+        
+        if not update_text:
+            # No text provided - show updates feed
+            print(f"   📖 Showing updates feed...")
+            from update_manager import get_updates_feed, format_updates_feed
+            
+            updates = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_updates_feed, 20, sender)
+            feed_message = format_updates_feed(updates)
+            
+            await send_text(session, chat_id, feed_message)
+            print("   ✅ Updates feed sent.")
+            return
+        else:
+            # Post new update
+            print(f"   📝 Posting update: {update_text[:50]}...")
+            from update_manager import post_update
+            
+            success = await loop.run_in_executor(CPU_BOUND_EXECUTOR, post_update, sender, update_text)
+            
+            if success:
+                await send_text(session, chat_id, "✅ Update posted! People in your network will see this.")
+                print("   ✅ Update posted successfully.")
+            else:
+                await send_text(session, chat_id, "❌ Failed to post update. Please try again later.")
+                print("   ⚠️  Failed to post update.")
+            return
+    
+    # Natural language detection for update queries
+    # Check if user is asking about updates (before normal conversation flow)
+    text_lower = text.strip().lower()
+    update_keywords = [
+        "what's the latest update",
+        "what are the latest updates",
+        "show me updates",
+        "show updates",
+        "latest update",
+        "what updates",
+        "any updates",
+        "recent updates",
+        "what's new",
+        "whats new",
+        "show me what's new",
+        "what's happening",
+        "whats happening",
+        "what are people up to",
+        "what's going on"
+    ]
+    
+    is_update_query = any(keyword in text_lower for keyword in update_keywords)
+    
+    if is_update_query:
+        print(f"   📢 Update query detected: {text[:50]}...")
+        from update_manager import get_updates_feed, format_updates_feed
+        
+        updates = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_updates_feed, 20, sender)
+        feed_message = format_updates_feed(updates)
+        
+        await send_text(session, chat_id, feed_message)
+        print("   ✅ Updates feed sent in response to query.")
         return
     
     # Handle reset confirmation
@@ -1526,11 +1703,54 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                         if len(names) >= 2:
                             display_name = f"{names[0]} & {names[1]}"
             
+            # Get enhanced group context: engagement, topics, sentiment
+            engagement_insights = None
+            recent_topics = []
+            health_metrics = None
+            common_hobbies = []
+            
+            if group_chat_info:
+                try:
+                    from group_chat_intelligence import get_engagement_insights, get_recent_topics
+                    from group_chat_manager import get_group_chat_health_metrics
+                    
+                    engagement_insights = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        get_engagement_insights,
+                        group_chat_info.get('id')
+                    )
+                    
+                    topics_data = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        get_recent_topics,
+                        group_chat_info.get('id'),
+                        5
+                    )
+                    recent_topics = [t.get('topic_text') for t in topics_data if t.get('topic_text')]
+                    
+                    health_metrics = await loop.run_in_executor(
+                        CPU_BOUND_EXECUTOR,
+                        get_group_chat_health_metrics,
+                        group_chat_info.get('id')
+                    )
+                    
+                    # Get common hobbies from group chat
+                    common_hobbies = group_chat_info.get('common_hobbies', [])
+                    
+                    print(f"   📊 Engagement: {len(engagement_insights.get('active_participants', []))} active, {len(engagement_insights.get('quiet_participants', []))} quiet")
+                    print(f"   📝 Topics: {len(recent_topics)} recent topics")
+                except Exception as e:
+                    print(f"   ⚠️  Error getting enhanced context: {e}")
+            
             group_context = {
                 "is_group_chat": True,
                 "display_name": display_name,
                 "participants": participants,
-                "recent_messages": group_history
+                "recent_messages": group_history,
+                "engagement_insights": engagement_insights,
+                "recent_topics": recent_topics,
+                "health_metrics": health_metrics,
+                "common_hobbies": common_hobbies
             }
             print(f"   👥 Group context: {len(participants)} participants, {len(group_history)} recent messages")
         except Exception as e:

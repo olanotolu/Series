@@ -166,3 +166,117 @@ def get_group_chat_profiles(group_chat_id: int) -> List[Dict]:
         print(f"   ⚠️  Error getting profiles: {e}")
         return []
 
+
+# Analytics functions
+def get_group_chat_analytics(group_chat_id: int, period_type: str = 'daily') -> Optional[Dict]:
+    """Get analytics for a group chat for a specific period."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    
+    try:
+        from datetime import datetime, timedelta
+        
+        if period_type == 'daily':
+            period_start = datetime.now() - timedelta(days=1)
+        else:  # weekly
+            period_start = datetime.now() - timedelta(days=7)
+        
+        response = client.table('group_chat_analytics')\
+            .select('*')\
+            .eq('group_chat_id', group_chat_id)\
+            .eq('period_type', period_type)\
+            .gte('period_start', period_start.isoformat())\
+            .order('period_start', desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        print(f"   ⚠️  Error getting analytics: {e}")
+        return None
+
+
+def get_group_chat_topics(group_chat_id: int, limit: int = 10) -> List[Dict]:
+    """Get topics for a group chat, ordered by relevance."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    
+    try:
+        response = client.table('group_chat_topics')\
+            .select('*')\
+            .eq('group_chat_id', group_chat_id)\
+            .order('relevance_score', desc=True)\
+            .order('last_mentioned_at', desc=True)\
+            .limit(limit)\
+            .execute()
+        
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"   ⚠️  Error getting topics: {e}")
+        return []
+
+
+def get_participant_engagement(group_chat_id: int) -> List[Dict]:
+    """Get engagement metrics for all participants."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    
+    try:
+        response = client.table('group_chat_participant_engagement')\
+            .select('*')\
+            .eq('group_chat_id', group_chat_id)\
+            .order('engagement_score', desc=True)\
+            .execute()
+        
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"   ⚠️  Error getting engagement: {e}")
+        return []
+
+
+def get_group_chat_summaries(group_chat_id: int, summary_type: str = 'daily', limit: int = 5) -> List[Dict]:
+    """Get conversation summaries for a group chat."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    
+    try:
+        response = client.table('group_chat_summaries')\
+            .select('*')\
+            .eq('group_chat_id', group_chat_id)\
+            .eq('summary_type', summary_type)\
+            .order('period_start', desc=True)\
+            .limit(limit)\
+            .execute()
+        
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"   ⚠️  Error getting summaries: {e}")
+        return []
+
+
+def get_group_chat_health_metrics(group_chat_id: int) -> Optional[Dict]:
+    """Get health metrics for a group chat."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    
+    try:
+        gc = client.table('group_chats')\
+            .select('health_score, avg_boring_score')\
+            .eq('id', group_chat_id)\
+            .limit(1)\
+            .execute()
+        
+        if gc.data and len(gc.data) > 0:
+            return gc.data[0]
+        return None
+    except Exception as e:
+        print(f"   ⚠️  Error getting health metrics: {e}")
+        return None
+

@@ -61,12 +61,15 @@ Message: "{text}"
 
 Topics:"""
         
-        response = await hf_client.text_generation(
-            prompt=prompt,
+        # Use chat_completion instead of text_generation for this model
+        messages = [{"role": "user", "content": prompt}]
+        response_obj = await hf_client.chat_completion(
+            messages=messages,
             model="meta-llama/Llama-3.2-3B-Instruct",
-            max_new_tokens=50,
+            max_tokens=50,
             temperature=0.3
         )
+        response = response_obj.choices[0].message.content if response_obj.choices else ""
         
         topics_text = response.strip()
         if not topics_text or topics_text.lower() in ['none', 'n/a', '']:
@@ -149,12 +152,15 @@ Message: "{text}"
 
 Sentiment score:"""
         
-        response = await hf_client.text_generation(
-            prompt=prompt,
+        # Use chat_completion instead of text_generation for this model
+        messages = [{"role": "user", "content": prompt}]
+        response_obj = await hf_client.chat_completion(
+            messages=messages,
             model="meta-llama/Llama-3.2-3B-Instruct",
-            max_new_tokens=10,
+            max_tokens=10,
             temperature=0.1
         )
+        response = response_obj.choices[0].message.content if response_obj.choices else ""
         
         # Try to extract number from response
         import re
@@ -171,20 +177,53 @@ Sentiment score:"""
         return 0.0
 
 
-async def analyze_boring_score(text: str) -> float:
+def calculate_boring_score_heuristic(text: str) -> float:
     """
-    Analyze how boring/dry a message is using LLM.
+    Calculate boring score using simple heuristics (fallback when LLM fails).
     Returns boring score from 1 (very interesting) to 10 (very boring/dry).
-    Lower scores = more interesting, Higher scores = more boring.
     """
-    if not await init_hf_client():
-        return 5.0  # Default neutral score
-    
     if not text or len(text.strip()) < 3:
         return 5.0
     
-    try:
-        prompt = f"""Rate how boring or dry this message is on a scale of 1 to 10. Respond with ONLY a number:
+    text_lower = text.lower().strip()
+    score = 5.0  # Start neutral
+    
+    # Very short responses are boring
+    if len(text) <= 3:
+        score += 3.0  # "ok", "yeah", "yes" etc.
+    elif len(text) <= 10:
+        score += 2.0  # Very short
+    elif len(text) <= 20:
+        score += 1.0  # Short
+    
+    # Common boring words/phrases
+    boring_phrases = ['ok', 'yeah', 'yep', 'sure', 'cool', 'nice', 'hmm', 'lol', 'haha', 'okay', 'alright', 'k', 'kk']
+    if text_lower in boring_phrases:
+        score += 2.0
+    
+    # Questions and longer messages are more interesting
+    if '?' in text:
+        score -= 1.0  # Questions show engagement
+    if len(text) > 50:
+        score -= 1.0  # Longer messages show effort
+    
+    # Clamp to 1-10 range
+    return max(1.0, min(10.0, score))
+
+
+async def analyze_boring_score(text: str) -> float:
+    """
+    Analyze how boring/dry a message is using LLM, with heuristic fallback.
+    Returns boring score from 1 (very interesting) to 10 (very boring/dry).
+    Lower scores = more interesting, Higher scores = more boring.
+    """
+    if not text or len(text.strip()) < 3:
+        return 5.0
+    
+    # Try LLM first
+    if await init_hf_client():
+        try:
+            prompt = f"""Rate how boring or dry this message is on a scale of 1 to 10. Respond with ONLY a number:
 1 = very interesting, engaging, creative
 5 = neutral, average
 10 = very boring, dry, uninteresting
@@ -194,27 +233,29 @@ Consider: engagement level, creativity, interest, energy, enthusiasm.
 Message: "{text}"
 
 Boring score (1-10):"""
-        
-        response = await hf_client.text_generation(
-            prompt=prompt,
-            model="meta-llama/Llama-3.2-3B-Instruct",
-            max_new_tokens=10,
-            temperature=0.1
-        )
-        
-        # Try to extract number from response
-        import re
-        numbers = re.findall(r'\d+\.?\d*', response.strip())
-        if numbers:
-            score = float(numbers[0])
-            # Clamp to 1 to 10 range
-            return max(1.0, min(10.0, score))
-        
-        return 5.0  # Default neutral
-        
-    except Exception as e:
-        print(f"   ⚠️  Error analyzing boring score: {e}")
-        return 5.0
+            
+            # Use chat_completion instead of text_generation for this model
+            messages = [{"role": "user", "content": prompt}]
+            response_obj = await hf_client.chat_completion(
+                messages=messages,
+                model="meta-llama/Llama-3.2-3B-Instruct",
+                max_tokens=10,
+                temperature=0.1
+            )
+            response = response_obj.choices[0].message.content if response_obj.choices else ""
+            
+            # Try to extract number from response
+            import re
+            numbers = re.findall(r'\d+\.?\d*', response.strip())
+            if numbers:
+                score = float(numbers[0])
+                # Clamp to 1 to 10 range
+                return max(1.0, min(10.0, score))
+        except Exception as e:
+            print(f"   ⚠️  LLM boring score failed, using heuristic: {e}")
+    
+    # Fallback to heuristic
+    return calculate_boring_score_heuristic(text)
 
 
 def update_avg_boring_score(group_chat_id: int) -> float:

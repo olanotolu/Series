@@ -48,17 +48,29 @@ def get_openai_client():
     return openai_client
 
 def get_supabase_client():
-    """Get or create Supabase client."""
+    """Get or create Supabase client.
+    Uses service_role key if available (for admin/backend operations),
+    otherwise falls back to anon key.
+    """
     global supabase_client
     if not SUPABASE_AVAILABLE:
         return None
     
     if supabase_client is None:
         url = os.getenv('SUPABASE_URL')
-        key = os.getenv('SUPABASE_KEY')
+        # Prefer service_role key for admin operations (bypasses RLS)
+        key = os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_KEY')
         if not url or not key:
             print("⚠️  SUPABASE_URL or SUPABASE_KEY not set")
             return None
+        
+        # Check if using service_role key
+        using_service_role = bool(os.getenv('SUPABASE_SERVICE_ROLE_KEY'))
+        if using_service_role:
+            print("   ✅ Using Supabase service_role key (admin access)")
+        else:
+            print("   ⚠️  Using Supabase anon key (may have RLS restrictions)")
+        
         supabase_client = create_client(url, key)
     
     return supabase_client
