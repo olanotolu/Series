@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.local
+.env.*.local
 
 # Python
 __pycache__/
@@ -10,13 +12,36 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
+*.egg-info/
+dist/
+build/
 
-# Audio files (keep Marquee.m4a but ignore others)
+# Logs
+*.log
+*.log.*
+consumer.log
+consumer_output.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+sessions.db
+
+# Audio files (production uses S3)
+audio_files/
 *.wav
 *.opus
 *.mp3
 *.m4a
-!Marquee.m4a
+!Marquee.m4a  # Keep example if needed
+
+# Test files and outputs
+test_*.py
+test_*.wav
+test_*.m4a
+*.test.py
 
 # Dead Letter Queue
 dlq/
@@ -24,15 +49,69 @@ dlq/
 # Output files
 output.json
 *.json
-!requirements.txt
+!package.json
+!package-lock.json
+!tsconfig.json
+!next.config.ts
+!eslint.config.mjs
+!postcss.config.mjs
+
+# Next.js
+.next/
+out/
+.vercel
+
+# Node modules
+node_modules/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Large binary files (keep only essential)
+*.png
+*.jpg
+*.jpeg
+*.gif
+!placeholder-*.svg
+
+# AWS/Lambda
+.aws/
+*.zip
+lambda-package/
+
+# Coverage reports
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json

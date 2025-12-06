@@ -256,6 +256,36 @@ Minimal, draggable SISI interface. Real-time network visualization.
 
 ---
 
+## The Journey
+
+### Week 1: Foundation
+- Kafka consumer setup
+- Basic message processing
+- Audio handling (OPUS → WAV)
+
+### Week 2: Intelligence
+- Onboarding flow
+- Personality embeddings
+- Matching system
+
+### Week 3: Group Chats
+- Group chat creation
+- Message analysis
+- Engagement tracking
+
+### Week 4: Intelligence Layer
+- Boring score system
+- Sentiment analysis
+- Topic extraction
+- Match replacement
+
+### Week 5: Updates & Interface
+- User updates feature
+- SISI Next.js interface
+- Natural language queries
+
+---
+
 ## Getting Started
 
 ### Backend
@@ -268,13 +298,13 @@ pip install -r requirements.txt
 cp .env.example .env
 # Add: KAFKA_BOOTSTRAP_SERVERS, SUPABASE_URL, SUPABASE_KEY, etc.
 
-# Run migrations in Supabase (see migrations/README.md):
-# - migrations/setup_supabase_table.sql
-# - migrations/migrate_add_profile_columns.sql
-# - migrations/migrate_add_matching_tables.sql
-# - migrations/migrate_add_group_chats.sql
-# - migrations/migrate_group_chat_intelligence.sql
-# - migrations/migrate_add_user_updates.sql
+# Run migrations in Supabase:
+# - setup_supabase_table.sql
+# - migrate_add_profile_columns.sql
+# - migrate_add_matching_tables.sql
+# - migrate_add_group_chats.sql
+# - migrate_group_chat_intelligence.sql
+# - migrate_add_user_updates.sql
 
 # Start consumer
 python consumer.py
@@ -289,20 +319,6 @@ cp .env.local.example .env.local
 # Add: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_KEY
 npm run dev
 ```
-
----
-
-## Project Structure
-
-See `PROJECT_STRUCTURE.md` for detailed organization.
-
-**Quick Overview:**
-- `consumer.py` - Main application
-- `migrations/` - Database migrations
-- `tests/` - Test files
-- `docs/` - Documentation
-- `scripts/` - Utility scripts
-- `sisi-nextjs/` - Frontend interface
 
 ---
 
@@ -358,21 +374,80 @@ Every conversation teaches the AI:
 
 ---
 
-## Documentation
+## The Files
 
-- **README.md** (this file) - Main project overview
-- **TECH_STACK_SUMMARY.md** - Quick tech overview
-- **PROJECT_STRUCTURE.md** - Detailed file organization
-- **CONTRIBUTING.md** - How to contribute
-- **docs/** - Additional documentation
-- **migrations/README.md** - Database migration guide
-- **tests/README.md** - Testing guide
+### Core Backend
+- `consumer.py` - Main message processor
+- `group_chat_intelligence.py` - Conversation analysis
+- `user_matching.py` - Personality matching
+- `update_manager.py` - User updates
+- `match_replacement.py` - Better match offers
+
+### Database
+- `setup_supabase_table.sql` - Initial schema
+- `migrate_add_profile_columns.sql` - Profile data
+- `migrate_add_matching_tables.sql` - Matching system
+- `migrate_add_group_chats.sql` - Group chat support
+- `migrate_group_chat_intelligence.sql` - Intelligence layer
+- `migrate_add_user_updates.sql` - Updates feature
+
+### Frontend
+- `sisi-nextjs/` - Next.js interface
+  - `app/page.tsx` - Main interface
+  - `app/components/` - React components
+  - `app/api/` - Supabase API routes
+
+---
+
+## The Future
+
+### Coming Soon
+- Image recognition ("guess who I'm with")
+- User photo upload during onboarding
+- Real-time network graph in SISI
+- Voice message support
+
+### Ideas
+- Reactions on updates (👍 ❤️)
+- Comments on updates
+- Mentions (@username)
+- Daily conversation summaries
+- Smart reminders for quiet chats
+
+---
+
+## The Team
+
+Built for the **Series Hackathon** with:
+- **AI that understands** - Personality-based matching
+- **Intelligence that helps** - Proactive conversation facilitation  
+- **Design that delights** - Minimal, draggable interface
+- **Code that scales** - Async Python, real-time processing
+
+---
+
+## The Impact
+
+**Before Series:**
+- Fill out forms
+- Match on photos
+- Hope conversations work
+- No help when they don't
+
+**With Series:**
+- Natural conversation
+- Match on personality
+- AI keeps conversations alive
+- Better matches when needed
+
+**The Difference:**
+We don't just connect people. We understand them, match them intelligently, and help them build real relationships.
 
 ---
 
 ## License
 
-MIT - See LICENSE file
+MIT
 
 ---
 
