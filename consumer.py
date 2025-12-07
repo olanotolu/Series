@@ -2068,11 +2068,11 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                     return []
                 
                 try:
-                    # Get matches where user is either user1 or user2
+                    # Get matches where user is either user1 or user2 (both accepted and pending)
                     result = client.table('matches')\
                         .select('id, user1_id, user2_id, score, status, matched_at')\
                         .or_(f'user1_id.eq.{user_id},user2_id.eq.{user_id}')\
-                        .eq('status', 'accepted')\
+                        .in_('status', ['accepted', 'pending'])\
                         .order('matched_at', desc=True)\
                         .limit(5)\
                         .execute()
@@ -2080,6 +2080,8 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                     return result.data if result.data else []
                 except Exception as e:
                     print(f"   ⚠️  Error getting matches: {e}")
+                    import traceback
+                    traceback.print_exc()
                     return []
             
             matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_user_matches)
@@ -2113,20 +2115,33 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
                 # User has a pending match waiting for confirmation
                 match_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, pending_match_id)
                 match_name = match_profile.get('name', 'your match') if match_profile else 'your match'
-                response_parts.append(f"🔍 You have a pending match with **{match_name}** waiting for your confirmation!")
+                match_age = match_profile.get('age', '') if match_profile else ''
+                match_school = match_profile.get('school', '') if match_profile else ''
+                
+                match_info = f"**{match_name}**"
+                if match_age:
+                    match_info += f", {match_age}"
+                if match_school:
+                    match_info += f" from {match_school}"
+                
+                response_parts.append(f"🔍 You have a pending match with {match_info} waiting for your confirmation!")
                 response_parts.append(f"Say 'yes' to open the chat with them.")
             elif matches:
-                # User has accepted matches
+                # User has matches (accepted or pending)
                 match_info = []
                 for match in matches[:3]:  # Show up to 3 matches
                     other_user_id = match['user2_id'] if match['user1_id'] == user_id else match['user1_id']
                     other_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, other_user_id)
                     other_name = other_profile.get('name', 'Unknown') if other_profile else 'Unknown'
                     score = match.get('score', 0)
+                    status = match.get('status', 'unknown')
                     match_info.append(f"**{other_name}** (match strength: {score:.0%})")
                 
                 if match_info:
-                    response_parts.append(f"✅ You're matched with:")
+                    # Check if all matches are accepted or if any are pending
+                    all_accepted = all(m.get('status') == 'accepted' for m in matches[:3])
+                    status_text = "matched with" if all_accepted else "have matches with"
+                    response_parts.append(f"✅ You're {status_text}:")
                     response_parts.append("\n".join(f"• {info}" for info in match_info))
             elif group_chats:
                 # User has group chats
