@@ -1497,6 +1497,93 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
         print("   ✅ Reset confirmation prompt sent.")
         return
     
+    # /findmatch or "find me a match" command - manually trigger matching
+    text_lower = text.strip().lower()
+    find_match_commands = ["/findmatch", "find me a match", "find a match", "find match", "get me a match", "match me"]
+    
+    if any(cmd in text_lower for cmd in find_match_commands):
+        print(f"   🔍 Manual match request received for {sender}...")
+        await start_typing(session, chat_id)
+        
+        # Check if onboarding is complete
+        is_complete = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.is_onboarding_complete, sender)
+        
+        if not is_complete:
+            await send_text(session, chat_id, "Please complete onboarding first! I need to know your name, school, age, and hobbies to find you a great match. 🎯")
+            await stop_typing(session, chat_id)
+            return
+        
+        # Get user profile
+        profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+        
+        if not profile:
+            await send_text(session, chat_id, "Sorry, couldn't retrieve your profile. Please complete onboarding first.")
+            await stop_typing(session, chat_id)
+            return
+        
+        # Check if user has an embedding
+        from embedding_service import get_user_vector
+        user_vector = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_user_vector, sender)
+        
+        if not user_vector:
+            # Generate embedding first
+            print(f"   🧠 No embedding found - generating one...")
+            embedding = await loop.run_in_executor(CPU_BOUND_EXECUTOR, generate_user_embedding, profile)
+            if embedding:
+                def store_embedding_wrapper():
+                    store_embedding(sender, embedding)
+                await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_embedding_wrapper)
+                print(f"   ✅ Embedding generated and stored")
+            else:
+                await send_text(session, chat_id, "Sorry, couldn't generate your personality profile. Please try again later.")
+                await stop_typing(session, chat_id)
+                return
+        
+        # Find matches
+        print(f"   🔍 Finding matches...")
+        matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, find_matches, sender, 5)
+        
+        if matches:
+            # Get enriched match data
+            enriched_matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_match_profiles, matches)
+            
+            if enriched_matches:
+                top_match = enriched_matches[0]
+                match_score = top_match.get('score', 0.0)
+                
+                # Calculate common hobbies
+                current_hobbies = profile.get('hobbies', '')
+                matched_hobbies = top_match.get('hobbies', '')
+                common = await loop.run_in_executor(
+                    CPU_BOUND_EXECUTOR,
+                    calculate_common_hobbies,
+                    current_hobbies,
+                    matched_hobbies
+                )
+                
+                # Format match message
+                match_msg = format_match_message(top_match, match_score, common)
+                
+                # Send match message
+                await send_text(session, chat_id, f"🔍 Found you a match!\n\n{match_msg}")
+                
+                # Store match info and set state to match_confirmation
+                match_user_id = top_match.get('user_id')
+                if match_user_id:
+                    def store_match_info():
+                        session_manager.set_pending_match(sender, match_user_id)
+                        session_manager.set_onboarding_state(sender, "match_confirmation")
+                    await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_match_info)
+                    print(f"   ✅ Match found: {top_match.get('name')} (score: {match_score:.2%}) - waiting for confirmation")
+            else:
+                await send_text(session, chat_id, "Sorry, I couldn't find any matches right now. There might not be enough users in the system yet. Try again later! 🎯")
+        else:
+            await send_text(session, chat_id, "Sorry, I couldn't find any matches right now. There might not be enough users in the system yet. Try again later! 🎯")
+        
+        await stop_typing(session, chat_id)
+        print("   ✅ Manual match request complete.")
+        return
+    
     # /retry command - retry matching to find a new match
     if text.strip().lower() == "/retry":
         print(f"   🔄 /retry command received for {sender}...")
