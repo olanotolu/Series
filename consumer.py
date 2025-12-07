@@ -1949,6 +1949,10 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
         next_state = get_next_state(onboarding_state)
         
         if next_state == "complete":
+            # Clear any existing pending match before starting fresh matching process
+            print(f"   🔄 Clearing any existing pending match before starting fresh matching...")
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.clear_pending_match, sender)
+            
             # Mark onboarding complete (wrap in function to handle kwargs)
             def complete_onboarding():
                 session_manager.update_profile(sender, onboarding_complete=True, onboarding_state="complete")
