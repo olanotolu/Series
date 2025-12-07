@@ -2035,6 +2035,134 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
     
     # Normal conversation flow (onboarding complete)
     print(f"   💬 Onboarding complete - using normal conversation flow")
+    
+    # Check if user is asking about their match/team/group chat
+    text_lower = text.strip().lower()
+    match_queries = [
+        "do i have a team", "do i have a match", "who is my match", "who is my teammate",
+        "show me my team", "show me my match", "what's my team", "what's my match",
+        "who did you match me with", "who am i matched with", "tell me about my match",
+        "my team", "my match", "my teammate", "have i been matched"
+    ]
+    
+    is_match_query = any(query in text_lower for query in match_queries)
+    
+    if is_match_query and not is_group_chat:
+        # User is asking about their match/team - check database
+        print(f"   🔍 User asking about match/team - checking database...")
+        await start_typing(session, chat_id)
+        
+        try:
+            # Get user's profile to get user_id
+            profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, sender)
+            user_id = profile.get('user_id') if profile else sender
+            
+            # Check for pending match
+            pending_match_id = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_pending_match, sender)
+            
+            # Check for active matches in database
+            def get_user_matches():
+                from embedding_service import get_supabase_client
+                client = get_supabase_client()
+                if not client:
+                    return []
+                
+                try:
+                    # Get matches where user is either user1 or user2
+                    result = client.table('matches')\
+                        .select('id, user1_id, user2_id, score, status, matched_at')\
+                        .or_(f'user1_id.eq.{user_id},user2_id.eq.{user_id}')\
+                        .eq('status', 'accepted')\
+                        .order('matched_at', desc=True)\
+                        .limit(5)\
+                        .execute()
+                    
+                    return result.data if result.data else []
+                except Exception as e:
+                    print(f"   ⚠️  Error getting matches: {e}")
+                    return []
+            
+            matches = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_user_matches)
+            
+            # Check for group chats
+            def get_user_group_chats():
+                from embedding_service import get_supabase_client
+                client = get_supabase_client()
+                if not client:
+                    return []
+                
+                try:
+                    # Get group chats where user is a participant
+                    result = client.table('group_chat_participants')\
+                        .select('group_chat_id, group_chats!inner(id, display_name, created_at, match_id)')\
+                        .eq('user_id', user_id)\
+                        .eq('is_ai', False)\
+                        .execute()
+                    
+                    return result.data if result.data else []
+                except Exception as e:
+                    print(f"   ⚠️  Error getting group chats: {e}")
+                    return []
+            
+            group_chats = await loop.run_in_executor(CPU_BOUND_EXECUTOR, get_user_group_chats)
+            
+            # Build response
+            response_parts = []
+            
+            if pending_match_id:
+                # User has a pending match waiting for confirmation
+                match_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, pending_match_id)
+                match_name = match_profile.get('name', 'your match') if match_profile else 'your match'
+                response_parts.append(f"🔍 You have a pending match with **{match_name}** waiting for your confirmation!")
+                response_parts.append(f"Say 'yes' to open the chat with them.")
+            elif matches:
+                # User has accepted matches
+                match_info = []
+                for match in matches[:3]:  # Show up to 3 matches
+                    other_user_id = match['user2_id'] if match['user1_id'] == user_id else match['user1_id']
+                    other_profile = await loop.run_in_executor(CPU_BOUND_EXECUTOR, session_manager.get_profile, other_user_id)
+                    other_name = other_profile.get('name', 'Unknown') if other_profile else 'Unknown'
+                    score = match.get('score', 0)
+                    match_info.append(f"**{other_name}** (match strength: {score:.0%})")
+                
+                if match_info:
+                    response_parts.append(f"✅ You're matched with:")
+                    response_parts.append("\n".join(f"• {info}" for info in match_info))
+            elif group_chats:
+                # User has group chats
+                chat_info = []
+                for gc in group_chats[:3]:  # Show up to 3 group chats
+                    gc_data = gc.get('group_chats', {}) if isinstance(gc.get('group_chats'), dict) else {}
+                    display_name = gc_data.get('display_name', 'Group Chat')
+                    chat_info.append(f"**{display_name}**")
+                
+                if chat_info:
+                    response_parts.append(f"💬 You're in these group chats:")
+                    response_parts.append("\n".join(f"• {info}" for info in chat_info))
+            else:
+                # No matches or group chats
+                response_parts.append("You don't have an active match or team yet.")
+                response_parts.append("Complete onboarding and I'll find you someone great! 🎯")
+            
+            response = "\n\n".join(response_parts)
+            await send_text(session, chat_id, response)
+            await stop_typing(session, chat_id)
+            
+            # Save to history
+            def save_context():
+                session_manager.add_message(sender, "user", text)
+                session_manager.add_message(sender, "assistant", response)
+            await loop.run_in_executor(CPU_BOUND_EXECUTOR, save_context)
+            
+            print(f"   ✅ Match/team query handled")
+            return
+            
+        except Exception as e:
+            print(f"   ⚠️  Error handling match query: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fall through to normal conversation flow
+    
     # Detect language
     detected_language = await detect_language(text)
     lang_names = {"en": "English", "hi": "Hindi", "fr": "French"}
