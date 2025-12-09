@@ -1,0 +1,4 @@
+$683f1861-31ed-40c6-b8ba-9da49a7938bb²›)user_id ÿÿÿÿÿÿÿÿÿ*string08Zdefault>vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:153608Zdefault(name ÿÿÿÿÿÿÿÿÿ*string08Zdefault*school ÿÿÿÿÿÿÿÿÿ*string08Zdefault'age ÿÿÿÿÿÿÿÿÿ*string08Zdefault+hobbies ÿÿÿÿÿÿÿÿÿ*string08Zdefault6
+updated_at ÿÿÿÿÿÿÿÿÿ*timestamp:ns:-08Zdefault"'
+lance.auto_cleanup.older_than14days"!
+lance.auto_cleanup.interval20

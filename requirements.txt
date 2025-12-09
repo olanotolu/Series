@@ -9,3 +9,5 @@ aiokafka
 boto3
 supabase
 openai
+lancedb
+pyarrow

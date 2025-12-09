@@ -2,7 +2,8 @@
 """
 User Matching Module - AI-Powered Matching with Embeddings
 
-Finds compatible users using cosine similarity on personality embeddings.
+Finds compatible users using vector similarity on personality embeddings.
+Uses LanceDB for fast similarity search, with Supabase fallback.
 Generates Series-style match messages.
 """
 
@@ -20,69 +21,52 @@ except ImportError:
     SUPABASE_AVAILABLE = False
     print("⚠️  Supabase not installed. Install with: pip install supabase")
 
+# LanceDB client
+try:
+    from lancedb_service import search_similar_users
+    LANCEDB_AVAILABLE = True
+except ImportError:
+    LANCEDB_AVAILABLE = False
+    print("⚠️  LanceDB service not available")
+
 from embedding_service import get_user_vector, get_supabase_client
 
 def find_matches(user_id: str, limit: int = 5) -> List[Dict]:
     """
-    Find matching users using pgvector cosine similarity.
+    Find matching users using LanceDB vector similarity search (primary).
+    Falls back to Supabase if LanceDB is unavailable.
     
     Args:
         user_id: Current user's phone number
         limit: Maximum number of matches to return
     
     Returns:
-        List of matches with user_id and similarity score
+        List of matches with user_id, score, and profile data
     """
-    client = get_supabase_client()
-    if not client:
-        return []
-    
     # Get user's embedding vector
     user_vector = get_user_vector(user_id)
     if not user_vector:
         print(f"   ⚠️  No embedding found for {user_id}")
         return []
     
-    # Try RPC first, but fallback is more reliable
-    # The RPC function has issues with vector type conversion in Supabase
-    try:
-        # Call PostgreSQL function via Supabase RPC
-        # Pass vector as list - Supabase will handle conversion
-        result = client.rpc(
-            'match_embeddings',
-            {
-                'target': user_vector,  # Pass as list
-                'match_limit': limit,
-                'exclude_id': user_id
-            }
-        ).execute()
-        
-        matches = result.data if result.data else []
-        
-        # If RPC returns results, use them
-        if len(matches) > 0:
-            print(f"   ✅ Found {len(matches)} match(es) via RPC for {user_id}")
-            return matches
-        
-        # RPC returned empty - check if there are other users
-        check_response = client.table('user_embeddings').select('user_id').neq('user_id', user_id).limit(1).execute()
-        if check_response.data and len(check_response.data) > 0:
-            # Other users exist but RPC returned empty - use fallback
-            print(f"   ⚠️  RPC returned 0 matches but other users exist, using fallback method...")
-            return find_matches_fallback(user_id, limit)
-        
-        # No other users exist
-        print(f"   ℹ️  No other users with embeddings found")
-        return []
-        
-    except Exception as e:
-        print(f"   ⚠️  RPC error (using fallback): {e}")
-        # Fallback: try direct query if RPC doesn't work
-        return find_matches_fallback(user_id, limit)
+    # Try LanceDB first (fast, scalable)
+    if LANCEDB_AVAILABLE:
+        try:
+            matches = search_similar_users(user_vector, exclude_user_id=user_id, limit=limit)
+            if matches:
+                print(f"   ✅ Found {len(matches)} match(es) via LanceDB for {user_id}")
+                return matches
+            else:
+                print(f"   ℹ️  No matches found in LanceDB for {user_id}")
+        except Exception as e:
+            print(f"   ⚠️  LanceDB search error (using Supabase fallback): {e}")
+    
+    # Fallback to Supabase (legacy support)
+    return find_matches_supabase_fallback(user_id, limit)
 
-def find_matches_fallback(user_id: str, limit: int = 5) -> List[Dict]:
+def find_matches_supabase_fallback(user_id: str, limit: int = 5) -> List[Dict]:
     """
-    Fallback matching using direct SQL query if RPC doesn't work.
+    Fallback matching using Supabase (for legacy support or when LanceDB unavailable).
     """
     client = get_supabase_client()
     if not client:
@@ -150,22 +134,31 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 def get_match_profiles(match_results: List[Dict]) -> List[Dict]:
     """
     Enrich match results with full profile data.
+    If matches already have profile data (from LanceDB), use it.
+    Otherwise, fetch from Supabase.
     
     Args:
-        match_results: List of matches with user_id and score
+        match_results: List of matches with user_id and score (may include profile data)
     
     Returns:
         List of enriched matches with profile data
     """
-    client = get_supabase_client()
-    if not client:
-        return []
-    
     enriched_matches = []
     
     for match in match_results:
         user_id = match.get('user_id')
         if not user_id:
+            continue
+        
+        # Check if profile data already exists (from LanceDB)
+        if all(key in match for key in ['name', 'school', 'age', 'hobbies']):
+            # Already enriched, use as-is
+            enriched_matches.append(match)
+            continue
+        
+        # Fetch from Supabase
+        client = get_supabase_client()
+        if not client:
             continue
         
         try:

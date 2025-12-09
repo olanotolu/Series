@@ -414,3 +414,5 @@ User → Series API → Kafka → Python Consumer (async) → AI Processing → 
 
 *Built with ❤️ for the Series Hackathon*
 
+
+

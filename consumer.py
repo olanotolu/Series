@@ -1531,7 +1531,7 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             embedding = await loop.run_in_executor(CPU_BOUND_EXECUTOR, generate_user_embedding, profile)
             if embedding:
                 def store_embedding_wrapper():
-                    store_embedding(sender, embedding)
+                    store_embedding(sender, embedding, profile)
                 await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_embedding_wrapper)
                 print(f"   ✅ Embedding generated and stored")
             else:
@@ -2053,7 +2053,7 @@ async def process_text_message(session: aiohttp.ClientSession, event_data: dict)
             if embedding:
                 # Store embedding
                 def store_embedding_wrapper():
-                    store_embedding(sender, embedding)
+                    store_embedding(sender, embedding, profile)
                 await loop.run_in_executor(CPU_BOUND_EXECUTOR, store_embedding_wrapper)
                 
                 # Find matches
